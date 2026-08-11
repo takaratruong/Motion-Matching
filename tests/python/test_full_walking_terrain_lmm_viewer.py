@@ -668,7 +668,43 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     assert call["formal_authority_predicate"] is _full_formal_artifact_authorities
     assert call["runtime_label_resolver"] is viewer_module._full_runtime_label
     assert matcher_call["search_device"] is None
+    assert matcher_call["diagnostic_stability"] is True
     assert fake_run_interactive(matcher, adapter, **call)["label"] == FULL_LABEL
+
+
+def test_full_formal_matcher_explicitly_keeps_diagnostic_stability_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = SimpleNamespace(
+        authority=object(),
+        spawn_native_xy=np.zeros(2),
+        spawn_heading=0.0,
+    )
+    matcher = object()
+    matcher_call: dict[str, object] = {}
+
+    def fake_matcher(*_args: object, **kwargs: object) -> object:
+        matcher_call.update(kwargs)
+        return matcher
+
+    monkeypatch.setattr(
+        viewer_module, "load_scene_terrain", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(viewer_module, "HybridMatcher", fake_matcher)
+    monkeypatch.setattr(viewer_module, "build_viewer_model", lambda *_args: object())
+    monkeypatch.setitem(
+        sys.modules,
+        "mujoco",
+        SimpleNamespace(MjModel=SimpleNamespace(from_xml_path=lambda _path: object())),
+    )
+    evaluator = viewer_module._MuJoCoRouteEvaluator(
+        object(), object(), g1_xml=Path("g1.xml"), fps=60.0
+    )
+
+    built, _, _ = evaluator._matcher("flat-standard")
+
+    assert built is matcher
+    assert matcher_call["diagnostic_stability"] is False
 
 
 def test_full_gpu_view_configures_before_load_and_wires_search_device(
@@ -863,6 +899,24 @@ def test_full_gpu_identity_and_label_remain_diagnostic(
     assert identity["first_runtime_search_elapsed_ms"] == 11.5
     assert "DIAGNOSTIC" in label
     assert "EXACT SEARCH" not in label
+
+
+def test_full_stability_label_reports_mechanical_filter_inventory() -> None:
+    matcher = SimpleNamespace(
+        diagnostic_stability=True,
+        diagnostic_mechanical_clearance_bounds_m=(0.4, 1.2),
+        diagnostic_mechanical_retained_searchable_row_count=5,
+        total_searchable_row_count=6,
+        search_backend_identity="single-gpu-mechanically-filtered-fp32:cuda:5",
+        search_acceptance_eligible=False,
+    )
+
+    label = viewer_module._full_runtime_label(matcher)
+
+    assert "MECHANICALLY FILTERED" in label
+    assert "0.400" in label
+    assert "1.200" in label
+    assert "5/6" in label
 
 
 def test_cli_matches_the_planned_smoke_and_view_commands() -> None:

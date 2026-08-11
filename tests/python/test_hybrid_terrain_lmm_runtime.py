@@ -82,6 +82,14 @@ def _motion_corpus() -> SimpleNamespace:
     )
 
 
+def _mechanically_safe(corpus: SimpleNamespace) -> SimpleNamespace:
+    corpus.artifacts.positions[:, 0, 1] = 0.0
+    corpus.artifacts.positions[:, 1, 1] = (
+        np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32) + 0.8
+    )
+    return corpus
+
+
 class _Generator:
     def __init__(self, rows: int = 8) -> None:
         self.latent = np.arange(rows, dtype=np.float32)[:, None]
@@ -171,6 +179,31 @@ def _limited_native_model() -> SimpleNamespace:
 
 
 class HybridTerrainRuntimeTests(unittest.TestCase):
+    def test_default_runtime_does_not_scan_diagnostic_clearance_column(self):
+        class GuardedPositions:
+            def __init__(self, values: np.ndarray) -> None:
+                self.values = values
+
+            def __len__(self) -> int:
+                return len(self.values)
+
+            def __getitem__(self, key):
+                if key == (slice(None), 1, 1):
+                    raise AssertionError("default runtime scanned diagnostic clearance")
+                return self.values[key]
+
+        corpus = _corpus()
+        corpus.artifacts.positions = GuardedPositions(corpus.artifacts.positions)
+
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+        )
+
+        self.assertFalse(matcher.diagnostic_stability)
+
     def test_se2_composition_rotates_local_delta_and_wraps_yaw(self):
         world = SE2Transform(np.asarray((2.0, -3.0)), np.pi / 2.0)
 
@@ -227,6 +260,243 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(second.heading, expected.yaw, places=7)
         placed_yaw = 2.0 * np.arctan2(placements[-1][1][2], placements[-1][1][0])
         self.assertAlmostEqual(placed_yaw, second.heading, delta=1e-6)
+
+    def test_diagnostic_stability_neutral_holds_after_one_command_event_search(self):
+        matcher = HybridMatcher(
+            _mechanically_safe(_motion_corpus()),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            selected = matcher.step(CommandState(), dt=matcher.dt)
+            world_xy = np.array(matcher._world_transform.xy, copy=True)
+            world_yaw = matcher._world_transform.yaw
+            source_xy = np.array(matcher._active_source_root.xy, copy=True)
+            source_yaw = matcher._active_source_root.yaw
+            for _ in range(20):
+                held = matcher.step(CommandState(), dt=matcher.dt)
+
+        self.assertIs(held, selected)
+        self.assertEqual(searched.call_count, 1)
+        np.testing.assert_array_equal(held.qpos, selected.qpos)
+        np.testing.assert_array_equal(
+            held.root_position_world, selected.root_position_world
+        )
+        np.testing.assert_array_equal(matcher._world_transform.xy, world_xy)
+        self.assertEqual(matcher._world_transform.yaw, world_yaw)
+        np.testing.assert_array_equal(matcher._active_source_root.xy, source_xy)
+        self.assertEqual(matcher._active_source_root.yaw, source_yaw)
+        self.assertEqual(held.fallback_count, selected.fallback_count)
+
+    def test_diagnostic_stability_searches_on_command_and_range_terminal_only(self):
+        matcher = HybridMatcher(
+            _mechanically_safe(_motion_corpus()),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        command = CommandState(speed=1.0)
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            rows = [matcher.step(command, dt=matcher.dt).row for _ in range(5)]
+            matcher.step(CommandState(speed=0.5), dt=matcher.dt)
+            matcher.step(CommandState(speed=0.5), dt=matcher.dt, force_search=True)
+
+        self.assertEqual(rows, [0, 1, 2, 3, 0])
+        self.assertEqual(searched.call_count, 4)
+
+    def test_diagnostic_stability_filters_mechanically_unsafe_exact_winner(self):
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.positions[0, 1, 1] = 0.2
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        result = matcher.match(np.asarray(corpus.features.values[0], np.float64))
+
+        self.assertNotIn(0, matcher.searchable_rows)
+        self.assertEqual(result.row, 1)
+        self.assertEqual(matcher.diagnostic_mechanical_rejected_row_count, 1)
+        self.assertEqual(matcher.diagnostic_mechanical_clearance_bounds_m, (0.4, 1.2))
+
+    def test_diagnostic_stability_terrain_envelope_uses_retained_searchable_rows(self):
+        values = np.zeros((8, 31), dtype=np.float32)
+        values[0, 27:31] = 100.0
+        corpus = _mechanically_safe(_corpus(values))
+        corpus.artifacts.positions[0, 1, 1] = 0.2
+
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        np.testing.assert_array_equal(matcher.terrain_feature_min, 0.0)
+        np.testing.assert_array_equal(matcher.terrain_feature_max, 0.0)
+
+    def test_diagnostic_stability_requires_simulation_root_height_invariant(self):
+        corpus = _corpus()
+        corpus.artifacts.positions[:, 1, 1] = (
+            np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32) + 0.8
+        )
+
+        with self.assertRaisesRegex(ValueError, "Simulation-root Y=0"):
+            HybridMatcher(
+                corpus,
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                diagnostic_stability=True,
+            )
+
+    def test_diagnostic_stability_requires_yaw_only_simulation_root(self):
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.rotations[3, 0] = quat.from_angle_axis(
+            0.1, np.asarray((1.0, 0.0, 0.0), dtype=np.float32)
+        )
+
+        with self.assertRaisesRegex(ValueError, "yaw-only Simulation roots"):
+            HybridMatcher(
+                corpus,
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                diagnostic_stability=True,
+            )
+
+    def test_diagnostic_stability_successor_stops_before_unsafe_row(self):
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.positions[1, 1, 1] = 0.2
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        self.assertEqual(matcher.successor(0), 0)
+        self.assertNotIn(1, matcher.searchable_rows)
+
+    def test_diagnostic_stability_successor_stops_at_clearance_discontinuity(self):
+        corpus = _mechanically_safe(_corpus())
+        support = np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32)
+        corpus.artifacts.positions[0, 1, 1] = support[0] + 0.6
+        corpus.artifacts.positions[1, 1, 1] = support[1] + 0.75
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        command = CommandState(speed=1.0)
+        matcher._last_command = command
+        matcher._last_terrain_class = matcher.state.terrain_class
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            state = matcher.step(command, dt=matcher.dt)
+
+        self.assertIn(0, matcher.searchable_rows)
+        self.assertIn(1, matcher.searchable_rows)
+        self.assertEqual(matcher.successor(0), 0)
+        self.assertEqual(state.row, 2)
+        self.assertEqual(set(searched.call_args.kwargs["excluded_rows"]), {0, 1})
+        self.assertEqual(matcher.diagnostic_mechanical_successor_clearance_limit_m, 0.1)
+        self.assertEqual(
+            matcher.diagnostic_mechanical_discontinuous_successor_edge_count, 1
+        )
+
+    def test_diagnostic_stability_neutral_holds_at_unsafe_successor_boundary(self):
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.positions[1, 1, 1] = 0.2
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        matcher._last_command = CommandState()
+        matcher._last_terrain_class = matcher.state.terrain_class
+        before = matcher.state
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            for _ in range(10):
+                held = matcher.step(CommandState(), dt=matcher.dt)
+
+        self.assertIs(held, before)
+        self.assertEqual(searched.call_count, 0)
+
+    def test_diagnostic_stability_unsafe_boundary_exclusion_survives_pose_retry(self):
+        class BoundaryGenerator(_Generator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reject_row_two = False
+
+            def decode(self, features: np.ndarray, latent: np.ndarray) -> np.ndarray:
+                row = int(np.asarray(latent).reshape(-1)[0])
+                output = np.zeros(458, dtype=np.float32)
+                output[0] = np.nan if self.reject_row_two and row == 2 else 100.0 + row
+                return output
+
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.positions[1, 1, 1] = 0.2
+        generator = BoundaryGenerator()
+        matcher = HybridMatcher(
+            corpus,
+            generator,
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        command = CommandState(speed=1.0)
+        matcher._last_command = command
+        matcher._last_terrain_class = matcher.state.terrain_class
+        generator.reject_row_two = True
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            state = matcher.step(command, dt=matcher.dt)
+
+        self.assertEqual(state.row, 4)
+        self.assertEqual(state.diagnostic_pose_rejection_count, 1)
+        self.assertEqual(searched.call_count, 2)
+        self.assertEqual(
+            tuple(searched.call_args_list[0].kwargs["excluded_rows"]), (0,)
+        )
+        self.assertEqual(
+            set(searched.call_args_list[1].kwargs["excluded_rows"]), {0, 2}
+        )
+
+    def test_diagnostic_stability_retains_observed_takara_clearance_band(self):
+        corpus = _corpus()
+        corpus.artifacts.positions[:, 0, 1] = 0.0
+        support = np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32)
+        corpus.artifacts.positions[:, 1, 1] = support + np.linspace(
+            0.7107, 0.8067, len(support), dtype=np.float32
+        )
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        self.assertEqual(matcher.diagnostic_mechanical_rejected_row_count, 0)
+        self.assertEqual(
+            len(matcher.searchable_rows), matcher.total_searchable_row_count
+        )
 
     def test_search_jump_reanchors_source_without_root_teleport(self):
         corpus = _motion_corpus()
@@ -483,6 +753,44 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
                     pose_converter=_pose_converter,
                     search_device=invalid,
                 )
+
+    def test_single_gpu_diagnostic_searches_complete_mechanically_retained_view(self):
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.positions[0, 1, 1] = 0.2
+        fake = _FakeSingleGpuSearch()
+
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ) as factory:
+            matcher = HybridMatcher(
+                corpus,
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+
+        self.assertEqual(
+            matcher.search_backend_identity,
+            "single-gpu-mechanically-filtered-fp32:cuda:5",
+        )
+        self.assertEqual(
+            matcher.search_scope, "diagnostic-mechanically-filtered-corpus"
+        )
+        self.assertNotIn(0, matcher.searchable_rows)
+        self.assertEqual(
+            len(matcher.searchable_rows),
+            matcher.diagnostic_mechanical_retained_searchable_row_count,
+        )
+        np.testing.assert_array_equal(
+            factory.call_args.args[1], matcher.searchable_rows
+        )
+        self.assertEqual(
+            factory.call_args.kwargs["exclusion_budget"],
+            matcher.candidate_retry_budget + 2,
+        )
 
     def test_single_gpu_passes_current_contact_range_and_explicit_exclusions(self):
         fake = _FakeSingleGpuSearch()
@@ -761,6 +1069,121 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(state.fallback_count, 1)
         self.assertEqual(state.decode_count, 0)
         self.assertEqual(generator.inputs, [])
+
+    def test_diagnostic_stability_holds_outside_domain_and_reverse_recovers(self):
+        unrestricted = [True]
+        terrain = TerrainAuthority(
+            lambda _xy: 0.0,
+            domain_contains=lambda xy: unrestricted[0] or float(xy[1]) >= -0.5,
+            name="finite-flat",
+        )
+        generator = _Generator()
+        matcher = HybridMatcher(
+            _mechanically_safe(_corpus()),
+            generator,
+            terrain,
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        unrestricted[0] = False
+        before = matcher.state
+        before_root = matcher._root_xy.copy()
+        before_world = matcher._world_transform
+        before_source = matcher._active_source_root
+        before_inputs = len(generator.inputs)
+
+        for expected_count in range(1, 6):
+            held = matcher.step(CommandState(speed=1.0), dt=0.04)
+            self.assertEqual(held.unsupported_hold_count, expected_count)
+
+        np.testing.assert_array_equal(held.qpos, before.qpos)
+        np.testing.assert_array_equal(
+            held.root_position_world, before.root_position_world
+        )
+        np.testing.assert_array_equal(matcher._root_xy, before_root)
+        np.testing.assert_array_equal(matcher._world_transform.xy, before_world.xy)
+        self.assertEqual(matcher._world_transform.yaw, before_world.yaw)
+        np.testing.assert_array_equal(matcher._active_source_root.xy, before_source.xy)
+        self.assertEqual(matcher._active_source_root.yaw, before_source.yaw)
+        self.assertEqual(held.pose_source, "held-outside-support")
+        self.assertEqual(held.support_status, "OUT OF TRAINED SUPPORT")
+        self.assertEqual(held.fallback_count, before.fallback_count)
+        self.assertEqual(held.decode_count, before.decode_count)
+        self.assertEqual(len(generator.inputs), before_inputs)
+
+        recovered = matcher.step(CommandState(speed=-1.0), dt=0.04)
+
+        self.assertEqual(recovered.pose_source, "learned")
+        self.assertEqual(recovered.support_status, "SUPPORTED")
+        self.assertEqual(recovered.unsupported_hold_count, 5)
+        self.assertEqual(recovered.fallback_count, before.fallback_count)
+        self.assertEqual(recovered.decode_count, before.decode_count + 1)
+
+    def test_diagnostic_stability_unsupported_preview_holds_before_search(self):
+        unrestricted = [True]
+        generator = _Generator()
+        matcher = HybridMatcher(
+            _mechanically_safe(_corpus()),
+            generator,
+            TerrainAuthority(
+                lambda _xy: 0.0,
+                domain_contains=lambda xy: (
+                    unrestricted[0] or float(np.asarray(xy)[1]) >= -0.5
+                ),
+                name="finite-flat",
+            ),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        unrestricted[0] = False
+        before = matcher.state
+        before_decodes = len(generator.inputs)
+
+        with mock.patch.object(
+            matcher, "match", side_effect=AssertionError("unsupported preview searched")
+        ):
+            held = matcher.step(CommandState(speed=1.0), dt=matcher.dt)
+
+        np.testing.assert_array_equal(held.qpos, before.qpos)
+        np.testing.assert_array_equal(
+            held.root_position_world, before.root_position_world
+        )
+        self.assertEqual(held.pose_source, "held-outside-support")
+        self.assertEqual(held.unsupported_hold_count, 1)
+        self.assertEqual(len(generator.inputs), before_decodes)
+
+    def test_diagnostic_stability_holds_outside_normalized_terrain_envelope(self):
+        values = np.zeros((8, 31), np.float32)
+        values[:4, 27:31] = -0.1
+        values[4:, 27:31] = 0.1
+        steep = [False]
+        terrain = TerrainAuthority(
+            lambda xy: -float(np.asarray(xy)[1]) if steep[0] else 0.0,
+            name="switchable-steep",
+        )
+        matcher = HybridMatcher(
+            _mechanically_safe(_corpus(values)),
+            _Generator(),
+            terrain,
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        before = matcher.state
+        before_world = matcher._world_transform
+        steep[0] = True
+
+        held = matcher.step(CommandState(speed=1.0), dt=0.04, force_search=True)
+
+        np.testing.assert_array_equal(held.qpos, before.qpos)
+        np.testing.assert_array_equal(
+            held.root_position_world, before.root_position_world
+        )
+        np.testing.assert_array_equal(matcher._world_transform.xy, before_world.xy)
+        self.assertEqual(matcher._world_transform.yaw, before_world.yaw)
+        self.assertEqual(held.pose_source, "held-outside-support")
+        self.assertEqual(held.support_status, "OUT OF TRAINED SUPPORT")
+        self.assertEqual(held.unsupported_hold_count, 1)
+        self.assertEqual(held.fallback_count, before.fallback_count)
 
     def test_finite_terrain_checks_root_and_exact_four_curved_preview_points(self):
         calls: list[np.ndarray] = []
@@ -1216,6 +1639,147 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(fallback.pose_source, "canonical-fallback")
         self.assertEqual(fallback.qpos[7], float(fallback.row))
         self.assertTrue(np.isfinite(fallback.qpos).all())
+
+    def test_diagnostic_stability_retries_decode_converter_and_root_step_failures(self):
+        class SelectiveGenerator(_Generator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_decode = False
+
+            def decode(self, features: np.ndarray, latent: np.ndarray) -> np.ndarray:
+                row = int(np.asarray(latent).reshape(-1)[0])
+                output = np.zeros(458, dtype=np.float32)
+                output[0] = np.nan if self.fail_decode and row == 0 else 100.0 + row
+                return output
+
+        for failure in ("decode", "converter", "root-step"):
+            with self.subTest(failure=failure):
+                generator = SelectiveGenerator()
+                enabled = [False]
+
+                def converter(*arguments):
+                    decoded = np.asarray(arguments[0])
+                    learned_row_zero = float(decoded[0]) == 100.0
+                    if enabled[0] and failure == "converter" and learned_row_zero:
+                        raise ValueError("selective learned conversion failure")
+                    qpos = _pose_converter(*arguments)
+                    if enabled[0] and failure == "root-step" and learned_row_zero:
+                        qpos[0] += 2.0
+                    return qpos
+
+                matcher = HybridMatcher(
+                    _mechanically_safe(_corpus()),
+                    generator,
+                    TerrainAuthority.flat(),
+                    pose_converter=converter,
+                    diagnostic_stability=True,
+                )
+                enabled[0] = True
+                generator.fail_decode = failure == "decode"
+
+                state = matcher.select_query(
+                    np.asarray(matcher.features[0], np.float64)
+                )
+
+                self.assertEqual(state.row, 1)
+                self.assertEqual(state.pose_source, "learned")
+                self.assertEqual(state.decode_count, 1)
+                self.assertEqual(state.fallback_count, 0)
+                self.assertEqual(state.diagnostic_pose_rejection_count, 1)
+                self.assertEqual(state.candidate_limit_rejection_count, 0)
+
+    def test_diagnostic_stability_root_step_exhaustion_holds_complete_baseline(self):
+        corpus = _mechanically_safe(_corpus())
+        corpus.fps = 60.0
+        corpus.horizons = (20, 40, 60)
+        corpus.candidate_retry_budget = 2
+        reject = [False]
+
+        def converter(*arguments):
+            decoded = np.asarray(arguments[0])
+            qpos = _pose_converter(*arguments)
+            if reject[0] and float(decoded[0]) >= 100.0:
+                qpos[0] += 2.0
+            return qpos
+
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=converter,
+            diagnostic_stability=True,
+        )
+        before = matcher.state
+        before_root = matcher._root_xy.copy()
+        before_world = matcher._world_transform
+        before_source = matcher._active_source_root
+        before_elapsed = matcher._elapsed_since_search
+        reject[0] = True
+
+        held = matcher.step(
+            CommandState(speed=1.0, steering=0.5),
+            dt=matcher.dt,
+            force_search=True,
+        )
+
+        np.testing.assert_array_equal(held.qpos, before.qpos)
+        np.testing.assert_array_equal(held.query, before.query)
+        np.testing.assert_array_equal(
+            held.root_position_world, before.root_position_world
+        )
+        np.testing.assert_array_equal(matcher._root_xy, before_root)
+        np.testing.assert_array_equal(matcher._world_transform.xy, before_world.xy)
+        self.assertEqual(matcher._world_transform.yaw, before_world.yaw)
+        np.testing.assert_array_equal(matcher._active_source_root.xy, before_source.xy)
+        self.assertEqual(matcher._active_source_root.yaw, before_source.yaw)
+        self.assertEqual(matcher._elapsed_since_search, before_elapsed)
+        self.assertEqual(held.pose_source, before.pose_source)
+        self.assertEqual(held.fallback_count, before.fallback_count)
+        self.assertEqual(held.diagnostic_pose_rejection_count, 2)
+        self.assertEqual(held.candidate_limit_rejection_count, 0)
+        self.assertTrue(held.candidate_exhausted)
+        self.assertEqual(held.candidate_exhaustion_count, 1)
+
+    def test_diagnostic_stability_cross_range_retry_is_search_reanchored(self):
+        class RetryGenerator(_Generator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reject_successor = False
+
+            def decode(self, features: np.ndarray, latent: np.ndarray) -> np.ndarray:
+                row = int(np.asarray(latent).reshape(-1)[0])
+                output = np.zeros(458, dtype=np.float32)
+                output[0] = (
+                    np.nan if self.reject_successor and row == 1 else 100.0 + row
+                )
+                return output
+
+        corpus = _mechanically_safe(_motion_corpus())
+        corpus.candidate_retry_budget = 2
+        generator = RetryGenerator()
+        matcher = HybridMatcher(
+            corpus,
+            generator,
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+        command = CommandState(speed=1.0)
+        matcher._last_command = command
+        matcher._last_terrain_class = matcher.state.terrain_class
+        generator.reject_successor = True
+        before_root = matcher.state.root_position_world.copy()
+
+        with mock.patch.object(matcher, "match", return_value=SearchResult(4, 0.25, 1)):
+            state = matcher.step(command, dt=matcher.dt)
+
+        self.assertEqual(state.row, 4)
+        self.assertEqual(state.pose_source, "learned")
+        self.assertEqual(state.diagnostic_pose_rejection_count, 1)
+        self.assertFalse(state.candidate_exhausted)
+        self.assertLess(
+            np.linalg.norm(state.root_position_world[:2] - before_root[:2]), 1.0
+        )
 
     def test_native_invalid_exact_winner_retries_next_exact_candidate_atomically(self):
         values = np.full((8, 31), 10.0, dtype=np.float32)

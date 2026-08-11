@@ -20,6 +20,12 @@ DT = 1.0 / FPS
 SEARCH_INTERVAL_S = 0.1
 MAX_SPEED_MPS = 0.45
 MAX_NATIVE_LIMIT_CANDIDATE_REJECTIONS = 32
+# Broad native-walking mechanical plausibility guards for the interactive
+# diagnostic.  They are not learned-pose quality scores or formal acceptance
+# thresholds.
+DIAGNOSTIC_MIN_PELVIS_SUPPORT_CLEARANCE_M = 0.4
+DIAGNOSTIC_MAX_PELVIS_SUPPORT_CLEARANCE_M = 1.2
+DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M = 0.1
 TERRAIN_INDICES = slice(27, 31)
 TRAJECTORY_INDICES = slice(15, 27)
 
@@ -236,6 +242,18 @@ class _NativeJointLimitError(ValueError):
     """A finite 36D pose exceeded an authenticated native joint range."""
 
 
+class _DiagnosticPoseError(ValueError):
+    """A learned diagnostic pose failed before native-valid commit."""
+
+
+class _OutsideSupportError(ValueError):
+    """A diagnostic placement or preview left authenticated terrain support."""
+
+
+class _DiagnosticMechanicalRowError(ValueError):
+    """A diagnostic candidate has implausible pelvis-to-support clearance."""
+
+
 @dataclass(frozen=True)
 class HybridRuntimeState:
     row: int
@@ -250,6 +268,8 @@ class HybridRuntimeState:
     decode_count: int
     fallback_count: int
     joint_clamp_count: int
+    diagnostic_pose_rejection_count: int
+    unsupported_hold_count: int
     max_joint_clamp_magnitude: float
     candidate_limit_rejection_count: int
     first_candidate_limit_rejection_row: int | None
@@ -296,7 +316,11 @@ class HybridMatcher:
         initial_root_xy: object = (0.0, 0.0),
         initial_heading: float = 0.0,
         cache_manifest_path: str | Path | None = None,
+        diagnostic_stability: bool = False,
     ) -> None:
+        if type(diagnostic_stability) is not bool:
+            raise TypeError("diagnostic stability must be a boolean")
+        self.diagnostic_stability = diagnostic_stability
         physical_search_device: int | None = None
         if search_device is not None:
             if type(search_device) is not str or not search_device.startswith("cuda:"):
@@ -383,9 +407,14 @@ class HybridMatcher:
             or np.any(self.feature_scale <= 0.0)
         ):
             raise ValueError("hybrid feature normalization is invalid")
-        terrain_columns = self.features[:, TERRAIN_INDICES]
-        self.terrain_feature_min = np.min(terrain_columns, axis=0).astype(np.float64)
-        self.terrain_feature_max = np.max(terrain_columns, axis=0).astype(np.float64)
+        if not self.diagnostic_stability:
+            terrain_columns = self.features[:, TERRAIN_INDICES]
+            self.terrain_feature_min = np.min(terrain_columns, axis=0).astype(
+                np.float64
+            )
+            self.terrain_feature_max = np.max(terrain_columns, axis=0).astype(
+                np.float64
+            )
 
         starts = np.asarray(self.artifacts.range_starts, dtype=np.int64)
         stops = np.asarray(self.artifacts.range_stops, dtype=np.int64)
@@ -446,6 +475,105 @@ class HybridMatcher:
         self.walking_speed_p95_mps = walking_speed
         row_families = self.family_ids[self.row_ranges]
         total_searchable = np.array(searchable, dtype=np.int64, copy=True)
+        self.diagnostic_mechanical_clearance_bounds_m: tuple[float, ...] = ()
+        self.diagnostic_mechanical_successor_clearance_limit_m: float | None = None
+        self.diagnostic_mechanical_rejected_row_count: int | None = None
+        self.diagnostic_mechanical_retained_row_count: int | None = None
+        self.diagnostic_mechanical_rejected_searchable_row_count: int | None = None
+        self.diagnostic_mechanical_retained_searchable_row_count: int | None = None
+        self.diagnostic_mechanical_discontinuous_successor_edge_count: int | None = None
+        self._diagnostic_mechanical_clearance: np.ndarray | None = None
+        self._diagnostic_mechanical_safe_rows: np.ndarray | None = None
+        self._diagnostic_mechanical_discontinuous_successors: np.ndarray | None = None
+        mechanically_searchable = total_searchable
+        if self.diagnostic_stability:
+            root_y = np.asarray(self.artifacts.positions[:, 0, 1], dtype=np.float64)
+            if (
+                root_y.shape != (len(self.features),)
+                or not np.isfinite(root_y).all()
+                or np.any(np.abs(root_y) > 1.0e-6)
+            ):
+                raise ValueError(
+                    "diagnostic clearance requires authenticated Simulation-root Y=0"
+                )
+            for component in (1, 3):
+                root_tilt = np.asarray(
+                    self.artifacts.rotations[:, 0, component], dtype=np.float64
+                )
+                if (
+                    root_tilt.shape != (len(self.features),)
+                    or not np.isfinite(root_tilt).all()
+                    or np.any(np.abs(root_tilt) > 1.0e-6)
+                ):
+                    raise ValueError(
+                        "diagnostic clearance requires authenticated yaw-only "
+                        "Simulation roots"
+                    )
+            clearance = np.asarray(
+                self.artifacts.positions[:, 1, 1], dtype=np.float64
+            ) - np.asarray(self.artifacts.terrain_support[:, 0], dtype=np.float64)
+            if (
+                clearance.shape != (len(self.features),)
+                or not np.isfinite(clearance).all()
+            ):
+                raise ValueError(
+                    "pelvis-to-support clearance must be finite per corpus row"
+                )
+            self.diagnostic_mechanical_clearance_bounds_m = (
+                DIAGNOSTIC_MIN_PELVIS_SUPPORT_CLEARANCE_M,
+                DIAGNOSTIC_MAX_PELVIS_SUPPORT_CLEARANCE_M,
+            )
+            self.diagnostic_mechanical_successor_clearance_limit_m = (
+                DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M
+            )
+            self._diagnostic_mechanical_clearance = clearance
+            self._diagnostic_mechanical_safe_rows = np.logical_and(
+                clearance >= DIAGNOSTIC_MIN_PELVIS_SUPPORT_CLEARANCE_M,
+                clearance <= DIAGNOSTIC_MAX_PELVIS_SUPPORT_CLEARANCE_M,
+            )
+            self.diagnostic_mechanical_rejected_row_count = int(
+                np.count_nonzero(~self._diagnostic_mechanical_safe_rows)
+            )
+            self.diagnostic_mechanical_retained_row_count = int(
+                np.count_nonzero(self._diagnostic_mechanical_safe_rows)
+            )
+            mechanically_searchable = total_searchable[
+                self._diagnostic_mechanical_safe_rows[total_searchable]
+            ]
+            if not len(mechanically_searchable):
+                raise ValueError(
+                    "diagnostic mechanical filter removed every searchable row"
+                )
+            searchable = mechanically_searchable
+            self.diagnostic_mechanical_rejected_searchable_row_count = int(
+                len(total_searchable) - len(mechanically_searchable)
+            )
+            self.diagnostic_mechanical_retained_searchable_row_count = int(
+                len(mechanically_searchable)
+            )
+            retained_terrain = self.features[mechanically_searchable, TERRAIN_INDICES]
+            self.terrain_feature_min = np.min(retained_terrain, axis=0).astype(
+                np.float64
+            )
+            self.terrain_feature_max = np.max(retained_terrain, axis=0).astype(
+                np.float64
+            )
+            discontinuous_successors = np.zeros(len(self.features), dtype=np.bool_)
+            discontinuous_successors[:-1] = (
+                self._diagnostic_mechanical_safe_rows[:-1]
+                & self._diagnostic_mechanical_safe_rows[1:]
+                & (self.row_ranges[:-1] == self.row_ranges[1:])
+                & (
+                    np.abs(clearance[1:] - clearance[:-1])
+                    > DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M
+                )
+            )
+            self._diagnostic_mechanical_discontinuous_successors = (
+                discontinuous_successors
+            )
+            self.diagnostic_mechanical_discontinuous_successor_edge_count = int(
+                np.count_nonzero(discontinuous_successors)
+            )
 
         def family_counts(rows: np.ndarray) -> tuple[tuple[str, int], ...]:
             counts: list[tuple[str, int]] = []
@@ -505,20 +633,35 @@ class HybridMatcher:
                         selected.append(chosen)
                 searchable = np.sort(np.concatenate(selected))
         self.searchable_rows = searchable.astype(np.int64, copy=False)
-        self.search_acceptance_eligible = len(
-            self.searchable_rows
-        ) == self.total_searchable_row_count and np.array_equal(
-            self.searchable_rows, total_searchable
+        self.search_acceptance_eligible = (
+            len(self.searchable_rows) == self.total_searchable_row_count
+            and np.array_equal(self.searchable_rows, total_searchable)
+            and not self.diagnostic_stability
         )
-        self.search_scope = (
-            "full-range-safe-corpus"
-            if self.search_acceptance_eligible
-            else "diagnostic-stratified-cap"
+        retained_view_complete = np.array_equal(
+            self.searchable_rows, mechanically_searchable
         )
-        if physical_search_device is not None and not self.search_acceptance_eligible:
-            raise ValueError(
-                "single-GPU search requires the full-range-safe searchable corpus"
+        if self.diagnostic_stability:
+            self.search_scope = (
+                "diagnostic-mechanically-filtered-corpus"
+                if retained_view_complete
+                else "diagnostic-mechanically-filtered-cap"
             )
+        else:
+            self.search_scope = (
+                "full-range-safe-corpus"
+                if self.search_acceptance_eligible
+                else "diagnostic-stratified-cap"
+            )
+        if physical_search_device is not None:
+            if self.diagnostic_stability and not retained_view_complete:
+                raise ValueError(
+                    "single-GPU search requires the complete mechanically filtered view"
+                )
+            if not self.diagnostic_stability and not self.search_acceptance_eligible:
+                raise ValueError(
+                    "single-GPU search requires the full-range-safe searchable corpus"
+                )
         self.search_view_sha256 = hashlib.sha256(
             np.ascontiguousarray(self.searchable_rows, dtype="<i8").tobytes()
         ).hexdigest()
@@ -526,7 +669,11 @@ class HybridMatcher:
         self.last_search_elapsed_ms: float | None = None
         self.warm_search_elapsed_ms: float | None = None
         if physical_search_device is None:
-            self.search_backend_identity = "cpu-ckdtree-exact"
+            self.search_backend_identity = (
+                "cpu-ckdtree-mechanically-filtered-exact"
+                if self.diagnostic_stability
+                else "cpu-ckdtree-exact"
+            )
             self._tree_values = np.asarray(self.features[searchable], dtype=np.float64)
             self._tree = cKDTree(
                 self._tree_values, compact_nodes=True, balanced_tree=True
@@ -549,7 +696,11 @@ class HybridMatcher:
             self._searchable_contact_counts = tuple(
                 int(value) for value in np.bincount(contact_codes, minlength=4)
             )
-            self.search_backend_identity = f"single-gpu-full-row-fp32:{search_device}"
+            self.search_backend_identity = (
+                f"single-gpu-mechanically-filtered-fp32:{search_device}"
+                if self.diagnostic_stability
+                else f"single-gpu-full-row-fp32:{search_device}"
+            )
             self._gpu_search = SingleGpuExactSearch(
                 self.features,
                 self.searchable_rows,
@@ -557,7 +708,11 @@ class HybridMatcher:
                 self.artifacts.contacts,
                 physical_device_index=physical_search_device,
                 transition_penalty=self.transition_penalty,
-                exclusion_budget=self.candidate_retry_budget,
+                exclusion_budget=(
+                    self.candidate_retry_budget + 2
+                    if self.diagnostic_stability
+                    else self.candidate_retry_budget
+                ),
             )
 
         self._elapsed_since_search = SEARCH_INTERVAL_S
@@ -572,15 +727,19 @@ class HybridMatcher:
         self._root_xy = np.array(self._initial_root_xy, copy=True)
         self._heading = self._initial_heading
         self._world_transform = SE2Transform(self._root_xy, self._heading)
-        self._active_source_root = self._source_root_transform(0)
+        initial_row = int(self.searchable_rows[0]) if self.diagnostic_stability else 0
+        initial_range = int(self.row_ranges[initial_row])
+        self._active_source_root = self._source_root_transform(initial_row)
         initial_terrain = self._preview_terrain(CommandState())
         initial_domain_supported = self._preview_domain_supported(CommandState())
-        initial_query = np.array(self.features[0], dtype=np.float64, copy=True)
+        initial_query = np.array(
+            self.features[initial_row], dtype=np.float64, copy=True
+        )
         initial_query[TERRAIN_INDICES] = self._normalize_terrain(initial_terrain)
         self.state = HybridRuntimeState(
-            row=0,
-            range_index=0,
-            family=self._family_name(0),
+            row=initial_row,
+            range_index=initial_range,
+            family=self._family_name(initial_range),
             qpos=_frozen(np.zeros(36), np.float64),
             query=_frozen(initial_query, np.float64),
             terrain_features=_frozen(initial_query[TERRAIN_INDICES], np.float64),
@@ -590,6 +749,8 @@ class HybridMatcher:
             decode_count=0,
             fallback_count=0,
             joint_clamp_count=0,
+            diagnostic_pose_rejection_count=0,
+            unsupported_hold_count=0,
             max_joint_clamp_magnitude=0.0,
             candidate_limit_rejection_count=0,
             first_candidate_limit_rejection_row=None,
@@ -618,7 +779,7 @@ class HybridMatcher:
             root_motion_source="canonical-simulation-se2",
         )
         self._commit_row(
-            0,
+            initial_row,
             initial_query,
             search_distance=0.0,
             count_decode=False,
@@ -994,7 +1155,15 @@ class HybridMatcher:
         if type(row) is not int or not 0 <= row < len(self.features):
             raise IndexError("runtime row is outside the corpus")
         range_index = int(self.row_ranges[row])
-        return min(row + 1, int(self.range_stops[range_index]) - 1)
+        candidate = min(row + 1, int(self.range_stops[range_index]) - 1)
+        if self.diagnostic_stability:
+            safe_rows = self._diagnostic_mechanical_safe_rows
+            discontinuous = self._diagnostic_mechanical_discontinuous_successors
+            if safe_rows is None or discontinuous is None:
+                raise AssertionError("diagnostic mechanical inventory is unavailable")
+            if not safe_rows[candidate] or discontinuous[row]:
+                return row
+        return candidate
 
     def _command_query(
         self, command: CommandState, live_terrain: np.ndarray
@@ -1214,6 +1383,13 @@ class HybridMatcher:
         live_domain_supported: bool | None = None,
         reject_learned_native_limit: bool = False,
     ) -> HybridRuntimeState:
+        if (
+            self.diagnostic_stability
+            and not self._diagnostic_mechanical_safe_rows[int(row)]
+        ):
+            raise _DiagnosticMechanicalRowError(
+                "diagnostic candidate is outside the mechanical clearance band"
+            )
         range_index = int(self.row_ranges[row])
         if live_raw is None:
             live_raw = self._preview_terrain(CommandState())
@@ -1237,11 +1413,17 @@ class HybridMatcher:
         learned_count = self.state.decode_count
         fallback_count = self.state.fallback_count
         joint_clamp_count = self.state.joint_clamp_count
+        diagnostic_pose_rejection_count = self.state.diagnostic_pose_rejection_count
+        unsupported_hold_count = self.state.unsupported_hold_count
         max_joint_clamp_magnitude = 0.0
         pose_source = "learned"
         support_status = self._terrain_support_status(
             live_normalized, domain_supported=bool(live_domain_supported)
         )
+        if self.diagnostic_stability and support_status != "SUPPORTED":
+            raise _OutsideSupportError(
+                "diagnostic placement is outside authenticated terrain support"
+            )
         try:
             if support_status != "SUPPORTED":
                 raise ValueError("live terrain is outside the corpus envelope")
@@ -1259,7 +1441,7 @@ class HybridMatcher:
             if count_decode:
                 learned_count += 1
         except _NativeJointLimitError:
-            if reject_learned_native_limit:
+            if reject_learned_native_limit or self.diagnostic_stability:
                 raise
             simulation_position, simulation_rotation = self._placed_transform(
                 canonical, target_root
@@ -1292,7 +1474,11 @@ class HybridMatcher:
             RuntimeError,
             TypeError,
             ValueError,
-        ):
+        ) as error:
+            if self.diagnostic_stability:
+                raise _DiagnosticPoseError(
+                    "diagnostic learned pose candidate failed validation"
+                ) from error
             simulation_position, simulation_rotation = self._placed_transform(
                 canonical, target_root
             )
@@ -1331,6 +1517,8 @@ class HybridMatcher:
             decode_count=learned_count,
             fallback_count=fallback_count,
             joint_clamp_count=joint_clamp_count,
+            diagnostic_pose_rejection_count=diagnostic_pose_rejection_count,
+            unsupported_hold_count=unsupported_hold_count,
             max_joint_clamp_magnitude=max_joint_clamp_magnitude,
             candidate_limit_rejection_count=(
                 self.state.candidate_limit_rejection_count
@@ -1365,6 +1553,17 @@ class HybridMatcher:
         self._active_source_root = self._source_root_transform(int(row))
         return proposed
 
+    def _hold_outside_support(self, baseline: HybridRuntimeState) -> HybridRuntimeState:
+        proposed = replace(
+            baseline,
+            pose_source="held-outside-support",
+            support_status="OUT OF TRAINED SUPPORT",
+            unsupported_hold_count=baseline.unsupported_hold_count + 1,
+            candidate_exhausted=False,
+        )
+        self.state = proposed
+        return proposed
+
     def _commit_with_native_limit_retry(
         self,
         row: int,
@@ -1375,6 +1574,7 @@ class HybridMatcher:
         live_domain_supported: bool,
         advance_source: bool = False,
         command: CommandState | None = None,
+        base_excluded_rows: Iterable[int] = (),
     ) -> HybridRuntimeState:
         baseline = self.state
         baseline_world = self._world_transform
@@ -1382,6 +1582,10 @@ class HybridMatcher:
         original_row = int(row)
         original_distance = float(search_distance)
         rejected: list[int] = []
+        native_rejected: list[int] = []
+        diagnostic_pose_rejected: list[int] = []
+        base_exclusions = self._normalized_excluded_rows(base_excluded_rows)
+        candidate_advances_source = bool(advance_source)
 
         base_query = np.array(query, dtype=np.float64, copy=True)
 
@@ -1391,7 +1595,7 @@ class HybridMatcher:
             candidate_query = np.array(base_query, dtype=np.float64, copy=True)
             candidate_live_raw = np.asarray(live_raw, dtype=np.float64)
             candidate_live_domain_supported = bool(live_domain_supported)
-            if advance_source:
+            if candidate_advances_source:
                 self._set_world_transform(baseline_world)
                 self._active_source_root = baseline_source
                 self._advance_world_to_source_row(int(candidate_row))
@@ -1428,17 +1632,35 @@ class HybridMatcher:
                     reject_learned_native_limit=True,
                 )
                 break
-            except _NativeJointLimitError:
-                rejected.append(int(row))
+            except _OutsideSupportError:
                 self._set_world_transform(baseline_world)
                 self._active_source_root = baseline_source
+                proposed = self._hold_outside_support(baseline)
+                break
+            except (
+                _DiagnosticMechanicalRowError,
+                _DiagnosticPoseError,
+                _NativeJointLimitError,
+            ) as error:
+                rejected.append(int(row))
+                if isinstance(error, _NativeJointLimitError):
+                    native_rejected.append(int(row))
+                elif isinstance(error, _DiagnosticPoseError):
+                    diagnostic_pose_rejected.append(int(row))
+                self._set_world_transform(baseline_world)
+                self._active_source_root = baseline_source
+                combined_exclusions = np.concatenate(
+                    (base_exclusions, np.asarray(rejected, dtype=np.int64))
+                )
                 if self.search_device is None:
-                    retry_exclusions = self._match_exclusions(rejected)
+                    retry_exclusions = self._match_exclusions(combined_exclusions)
                     contact_exhausted = len(retry_exclusions) == len(
                         self.searchable_rows
                     )
                 else:
-                    retry_exclusions = self._normalized_excluded_rows(rejected)
+                    retry_exclusions = self._normalized_excluded_rows(
+                        combined_exclusions
+                    )
                     contacts = np.asarray(self.artifacts.contacts)
                     active_contact = np.asarray(contacts[self.state.row])
                     retry_contacts = np.asarray(contacts[retry_exclusions])
@@ -1463,7 +1685,7 @@ class HybridMatcher:
                     len(rejected) >= self.candidate_retry_budget or contact_exhausted
                 )
                 if exhausted:
-                    if self._legacy_runtime:
+                    if self._legacy_runtime and not self.diagnostic_stability:
                         proposed = self._commit_row(
                             original_row,
                             original_query,
@@ -1475,16 +1697,21 @@ class HybridMatcher:
                     proposed = replace(
                         baseline,
                         candidate_limit_rejection_count=(
-                            baseline.candidate_limit_rejection_count + len(rejected)
+                            baseline.candidate_limit_rejection_count
+                            + len(native_rejected)
                         ),
                         first_candidate_limit_rejection_row=(
                             baseline.first_candidate_limit_rejection_row
                             if baseline.first_candidate_limit_rejection_row is not None
-                            else rejected[0]
+                            else (native_rejected[0] if native_rejected else None)
                         ),
                         max_candidate_limit_rejections_per_step=max(
                             baseline.max_candidate_limit_rejections_per_step,
-                            len(rejected),
+                            len(native_rejected),
+                        ),
+                        diagnostic_pose_rejection_count=(
+                            baseline.diagnostic_pose_rejection_count
+                            + len(diagnostic_pose_rejected)
                         ),
                         candidate_exhaustion_count=(
                             baseline.candidate_exhaustion_count + 1
@@ -1493,9 +1720,17 @@ class HybridMatcher:
                     )
                     self.state = proposed
                     break
-                result = self.match(prepared_query, excluded_rows=retry_exclusions)
+                retry_query = (
+                    base_query if self.diagnostic_stability else prepared_query
+                )
+                result = self.match(retry_query, excluded_rows=retry_exclusions)
                 row = result.row
                 search_distance = result.distance
+                if self.diagnostic_stability:
+                    # Only a real within-range successor composes source motion.
+                    # A retry selected by search is a jump and reanchors at the
+                    # unchanged baseline world transform.
+                    candidate_advances_source = False
                 (
                     prepared_query,
                     prepared_live_raw,
@@ -1505,16 +1740,20 @@ class HybridMatcher:
             proposed = replace(
                 proposed,
                 candidate_limit_rejection_count=(
-                    baseline.candidate_limit_rejection_count + len(rejected)
+                    baseline.candidate_limit_rejection_count + len(native_rejected)
                 ),
                 first_candidate_limit_rejection_row=(
                     baseline.first_candidate_limit_rejection_row
                     if baseline.first_candidate_limit_rejection_row is not None
-                    else rejected[0]
+                    else (native_rejected[0] if native_rejected else None)
                 ),
                 max_candidate_limit_rejections_per_step=max(
                     baseline.max_candidate_limit_rejections_per_step,
-                    len(rejected),
+                    len(native_rejected),
+                ),
+                diagnostic_pose_rejection_count=(
+                    baseline.diagnostic_pose_rejection_count
+                    + len(diagnostic_pose_rejected)
                 ),
                 candidate_exhausted=False,
             )
@@ -1560,25 +1799,67 @@ class HybridMatcher:
             live_domain_supported = self._preview_domain_supported(command)
             terrain_class = self.terrain.terrain_class(live)
             self._elapsed_since_search += elapsed
+            if self.diagnostic_stability:
+                preview_support_status = self._terrain_support_status(
+                    self._normalize_terrain(live),
+                    domain_supported=live_domain_supported,
+                )
+                if preview_support_status != "SUPPORTED":
+                    self._last_command = command
+                    self._last_terrain_class = terrain_class
+                    return self._hold_outside_support(self.state)
             command_event = self._last_command is None or command != self._last_command
             terrain_event = (
                 self._last_terrain_class is not None
                 and terrain_class != self._last_terrain_class
             )
-            search = (
-                bool(force_search)
-                or command_event
-                or terrain_event
-                or self._elapsed_since_search >= SEARCH_INTERVAL_S
+            range_index = int(self.row_ranges[self.state.row])
+            raw_successor = min(
+                self.state.row + 1, int(self.range_stops[range_index]) - 1
             )
+            successor_row = self.successor(self.state.row)
+            range_terminal = successor_row == self.state.row
+            mechanically_unsafe_successor_boundary = (
+                self.diagnostic_stability
+                and raw_successor != self.state.row
+                and self._diagnostic_mechanical_safe_rows is not None
+                and not self._diagnostic_mechanical_safe_rows[raw_successor]
+            )
+            discontinuous_successor_boundary = (
+                self.diagnostic_stability
+                and raw_successor != self.state.row
+                and self._diagnostic_mechanical_discontinuous_successors is not None
+                and self._diagnostic_mechanical_discontinuous_successors[self.state.row]
+            )
+            periodic_search = (
+                not self.diagnostic_stability
+                and self._elapsed_since_search >= SEARCH_INTERVAL_S
+            )
+            event_search = bool(force_search) or command_event or terrain_event
+            active_boundary_search = (
+                self.diagnostic_stability
+                and range_terminal
+                and command != CommandState()
+            )
+            search = event_search or periodic_search or active_boundary_search
+            if self.diagnostic_stability and command == CommandState() and not search:
+                self._last_command = command
+                self._last_terrain_class = terrain_class
+                return self.state
             query = self._command_query(command, live)
+            if discontinuous_successor_boundary:
+                boundary_exclusions = (self.state.row, raw_successor)
+            elif mechanically_unsafe_successor_boundary:
+                boundary_exclusions = (self.state.row,)
+            else:
+                boundary_exclusions = ()
             if search:
-                result = self.match(query)
+                result = self.match(query, excluded_rows=boundary_exclusions)
                 row = result.row
                 distance = result.distance
                 self._elapsed_since_search = 0.0
             else:
-                row = self.successor(self.state.row)
+                row = successor_row
                 distance = self.state.search_distance
             proposed = self._commit_with_native_limit_retry(
                 row,
@@ -1588,6 +1869,7 @@ class HybridMatcher:
                 live_domain_supported=live_domain_supported,
                 advance_source=not search,
                 command=command,
+                base_excluded_rows=boundary_exclusions,
             )
             if proposed.candidate_exhausted:
                 (
@@ -1641,7 +1923,8 @@ class HybridMatcher:
             )
             live = self._preview_terrain(CommandState())
             live_domain_supported = self._preview_domain_supported(CommandState())
-            query = np.array(self.features[0], dtype=np.float64, copy=True)
+            reset_row = int(self.searchable_rows[0]) if self.diagnostic_stability else 0
+            query = np.array(self.features[reset_row], dtype=np.float64, copy=True)
             query[TERRAIN_INDICES] = self._normalize_terrain(live)
             counters = (
                 self.state.decode_count,
@@ -1649,7 +1932,7 @@ class HybridMatcher:
                 self.state.joint_clamp_count,
             )
             reset_state = self._commit_row(
-                0,
+                reset_row,
                 query,
                 search_distance=0.0,
                 count_decode=False,

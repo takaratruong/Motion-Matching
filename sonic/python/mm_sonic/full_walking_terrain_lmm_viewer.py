@@ -57,8 +57,7 @@ FULL_LABEL = (
     "(EXACT SEARCH + LEARNED GENERATOR; FULL WALKING CORPUS ONLY)"
 )
 FULL_DIAGNOSTIC_LABEL = (
-    "FULL WALKING TERRAIN LMM "
-    "(DIAGNOSTIC CAPPED SEARCH OR WRONG-RATE RUNTIME; NOT ACCEPTANCE EVIDENCE)"
+    "FULL WALKING TERRAIN LMM (DIAGNOSTIC SEARCH/RUNTIME; NOT ACCEPTANCE EVIDENCE)"
 )
 FULL_DIAGNOSTIC_TERRAIN_LABEL = (
     "FULL WALKING TERRAIN LMM "
@@ -432,6 +431,25 @@ def _full_runtime_label(
     search_acceptance_current: bool | None = None,
     formal_authorities_current: bool | None = None,
 ) -> str:
+    if getattr(matcher, "diagnostic_stability", False):
+        bounds = tuple(getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ()))
+        retained = getattr(
+            matcher,
+            "diagnostic_mechanical_retained_searchable_row_count",
+            None,
+        )
+        total = getattr(matcher, "total_searchable_row_count", None)
+        if len(bounds) == 2 and retained is not None and total is not None:
+            return (
+                "FULL WALKING TERRAIN LMM "
+                f"(DIAGNOSTIC MECHANICALLY FILTERED {float(bounds[0]):.3f}.."
+                f"{float(bounds[1]):.3f} M; {int(retained)}/{int(total)} "
+                "RANGE-SAFE ROWS; NOT ACCEPTANCE EVIDENCE)"
+            )
+        return (
+            "FULL WALKING TERRAIN LMM "
+            "(DIAGNOSTIC MECHANICALLY FILTERED SEARCH; NOT ACCEPTANCE EVIDENCE)"
+        )
     if (
         getattr(matcher, "search_backend_identity", "cpu-ckdtree-exact")
         != "cpu-ckdtree-exact"
@@ -694,6 +712,7 @@ class _MuJoCoRouteEvaluator:
             native_model=native_model,
             initial_root_xy=adapter.spawn_native_xy,
             initial_heading=adapter.spawn_heading,
+            diagnostic_stability=False,
         )
         model = build_viewer_model(self.g1_xml, adapter)
         self.matchers[scene_id] = matcher
@@ -951,6 +970,36 @@ def _full_runtime_identity(
             "first_runtime_search_elapsed_ms": getattr(
                 matcher, "warm_search_elapsed_ms", None
             ),
+            "diagnostic_stability": getattr(matcher, "diagnostic_stability", False),
+            "diagnostic_mechanical_clearance_bounds_m": list(
+                getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ())
+            ),
+            "diagnostic_mechanical_retained_row_count": getattr(
+                matcher, "diagnostic_mechanical_retained_row_count", None
+            ),
+            "diagnostic_mechanical_rejected_row_count": getattr(
+                matcher, "diagnostic_mechanical_rejected_row_count", None
+            ),
+            "diagnostic_mechanical_retained_searchable_row_count": getattr(
+                matcher,
+                "diagnostic_mechanical_retained_searchable_row_count",
+                None,
+            ),
+            "diagnostic_mechanical_rejected_searchable_row_count": getattr(
+                matcher,
+                "diagnostic_mechanical_rejected_searchable_row_count",
+                None,
+            ),
+            "diagnostic_mechanical_successor_clearance_limit_m": getattr(
+                matcher,
+                "diagnostic_mechanical_successor_clearance_limit_m",
+                None,
+            ),
+            "diagnostic_mechanical_discontinuous_successor_edge_count": getattr(
+                matcher,
+                "diagnostic_mechanical_discontinuous_successor_edge_count",
+                None,
+            ),
         }
     )
     return identity
@@ -1049,6 +1098,7 @@ def main(argv: list[str] | None = None) -> int:
             search_device=arguments.search_device,
             initial_root_xy=adapter.spawn_native_xy,
             initial_heading=adapter.spawn_heading,
+            diagnostic_stability=True,
         )
         receipt = run_interactive(
             matcher,
