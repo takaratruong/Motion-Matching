@@ -10,6 +10,7 @@ from mm_sonic.hybrid_terrain_lmm_gpu_search import GpuSearchCandidates
 from mm_sonic.hybrid_terrain_lmm_runtime import (
     CommandState,
     HybridMatcher,
+    SEARCH_INTERVAL_S,
     SE2Transform,
     SearchResult,
     TerrainAuthority,
@@ -386,6 +387,43 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         self.assertEqual(searched.call_count, 2)
         self.assertEqual(len(fake.calls), 2)
+
+    def test_holden_controller_identity_properties_are_read_only(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            holden = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        raw = HybridMatcher(
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+        )
+
+        self.assertEqual(holden.controller_identity, "holden-bounded-velocity-v1")
+        self.assertEqual(raw.controller_identity, "raw-command-v1")
+        self.assertEqual(holden.controller_acceleration_mps2, 1.5)
+        self.assertEqual(holden.controller_deceleration_mps2, 2.0)
+        self.assertEqual(holden.controller_stop_speed_mps, 0.05)
+        self.assertEqual(holden.controller_search_interval_s, SEARCH_INTERVAL_S)
+        for name, value in (
+            ("controller_identity", "changed"),
+            ("controller_acceleration_mps2", 0.0),
+            ("controller_deceleration_mps2", 0.0),
+            ("controller_stop_speed_mps", 0.0),
+            ("controller_search_interval_s", 0.0),
+        ):
+            with self.subTest(name=name), self.assertRaises(AttributeError):
+                setattr(holden, name, value)
 
     def test_gpu_diagnostic_periodic_searches_on_exact_sixth_60hz_tick(self):
         fake = _FakeSingleGpuSearch()

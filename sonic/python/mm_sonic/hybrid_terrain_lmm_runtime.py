@@ -334,6 +334,7 @@ class HybridMatcher:
             raise ValueError("diagnostic row mask requires diagnostic stability")
         self.diagnostic_stability = diagnostic_stability
         self.diagnostic_canonical_source_pose = diagnostic_canonical_source_pose
+        self._controller_config = MatcherConfig()
         physical_search_device: int | None = None
         if search_device is not None:
             if type(search_device) is not str or not search_device.startswith("cuda:"):
@@ -857,6 +858,38 @@ class HybridMatcher:
             live_raw=initial_terrain,
             live_domain_supported=initial_domain_supported,
         )
+
+    @property
+    def controller_identity(self) -> str:
+        """Return the command controller active for this matcher configuration."""
+
+        if self.diagnostic_stability and self.search_device is not None:
+            return "holden-bounded-velocity-v1"
+        return "raw-command-v1"
+
+    @property
+    def controller_acceleration_mps2(self) -> float:
+        """Return the bounded controller acceleration limit."""
+
+        return self._controller_config.acceleration_mps2
+
+    @property
+    def controller_deceleration_mps2(self) -> float:
+        """Return the bounded controller deceleration limit."""
+
+        return self._controller_config.deceleration_mps2
+
+    @property
+    def controller_stop_speed_mps(self) -> float:
+        """Return the exact neutral threshold used by the bounded controller."""
+
+        return self._controller_config.stop_speed_mps
+
+    @property
+    def controller_search_interval_s(self) -> float:
+        """Return the runtime-authoritative search cadence in seconds."""
+
+        return SEARCH_INTERVAL_S
 
     def _family_name(self, range_index: int) -> str:
         family_id = int(self.family_ids[range_index])
@@ -1910,7 +1943,7 @@ class HybridMatcher:
             )
             effective_command = command
             if gpu_diagnostic:
-                config = MatcherConfig()
+                config = self._controller_config
                 current = torch.as_tensor(
                     self._shaped_velocity_local_xz, dtype=torch.float64
                 )
