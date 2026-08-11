@@ -1,0 +1,170 @@
+--- a/pfnn.cpp
++++ b/pfnn.cpp
+@@ -20,0 +21 @@
++#include <stdint.h>
+@@ -925,0 +927,85 @@
++/* Optional post-IK pose export. The ordinary demo never opens this stream. */
++
++static FILE* export_stream = NULL;
++static uint64_t export_frame_index = 0;
++static uint64_t export_frame_limit = 0;
++static int export_world_id = 0;
++
++static bool export_write(const void* data, size_t size) {
++  return fwrite(data, 1, size, export_stream) == size;
++}
++
++static void export_open(const char* path) {
++  export_stream = fopen(path, "wb");
++  if (export_stream == NULL) {
++    fprintf(stderr, "Could not open PFNN export '%s'\n", path);
++    exit(1);
++  }
++
++  /* PFNNXFM/v1 wire magic. */
++  const char magic[8] = {'P','F','N','N','X','F','M','\0'};
++  const uint32_t version = 1;
++  const uint32_t joint_count = Character::JOINT_NUM;
++  const uint32_t record_bytes = 912;
++  const uint32_t coordinate_system = 1; /* Holden Y-up, centimeters. */
++  const float fps = 60.0f;
++  const uint32_t reserved = 0;
++  if (!export_write(magic, sizeof(magic)) ||
++      !export_write(&version, sizeof(version)) ||
++      !export_write(&joint_count, sizeof(joint_count)) ||
++      !export_write(&record_bytes, sizeof(record_bytes)) ||
++      !export_write(&coordinate_system, sizeof(coordinate_system)) ||
++      !export_write(&fps, sizeof(fps)) ||
++      !export_write(&reserved, sizeof(reserved))) {
++    fprintf(stderr, "Could not write PFNN export header\n");
++    exit(1);
++  }
++  fflush(export_stream);
++}
++
++static void export_frame(void) {
++  if (export_stream == NULL) { return; }
++
++  const uint32_t world = (uint32_t)export_world_id;
++  const uint32_t flags = 1; /* Pose is post-reference-IK and final-FK. */
++  const float phase = character->phase;
++  const int center = Trajectory::LENGTH / 2;
++  const glm::vec3 root_position = glm::vec3(
++      trajectory->positions[center].x,
++      trajectory->heights[center],
++      trajectory->positions[center].z);
++  const float terrain_height = heightmap->sample(glm::vec2(
++      root_position.x, root_position.z));
++  const float root_xyz[3] = {
++      root_position.x, root_position.y, root_position.z};
++  const float forward_xz[2] = {
++      trajectory->directions[center].x,
++      trajectory->directions[center].z};
++
++  bool ok =
++      export_write(&export_frame_index, sizeof(export_frame_index)) &&
++      export_write(&world, sizeof(world)) &&
++      export_write(&flags, sizeof(flags)) &&
++      export_write(&phase, sizeof(phase)) &&
++      export_write(&terrain_height, sizeof(terrain_height)) &&
++      export_write(root_xyz, sizeof(root_xyz)) &&
++      export_write(forward_xz, sizeof(forward_xz));
++
++  for (int i = 0; ok && i < Character::JOINT_NUM; i++) {
++    const glm::mat4& transform = character->joint_global_anim_xform[i];
++    const glm::vec3 position = glm::vec3(transform[3]);
++    const glm::quat orientation = glm::normalize(glm::quat_cast(glm::mat3(transform)));
++    const float pose[7] = {
++        position.x, position.y, position.z,
++        orientation.w, orientation.x, orientation.y, orientation.z};
++    ok = export_write(pose, sizeof(pose));
++  }
++
++  if (!ok || fflush(export_stream) != 0) {
++    fprintf(stderr, "Could not write PFNN export frame %llu\n",
++        (unsigned long long)export_frame_index);
++    exit(1);
++  }
++  export_frame_index++;
++}
++
+@@ -1125,0 +1212,2 @@
++static int initial_world = 0;
++
+@@ -1128,0 +1217 @@
++  export_world_id = 0;
+@@ -1144,0 +1234 @@
++  export_world_id = 1;
+@@ -1161,0 +1252 @@
++  export_world_id = 2;
+@@ -1181,0 +1273 @@
++  export_world_id = 3;
+@@ -1230,0 +1323 @@
++  export_world_id = 4;
+@@ -1265,0 +1359 @@
++  export_world_id = 5;
+@@ -1467,0 +1562,11 @@
++static void load_world(int world) {
++  switch (world) {
++    case 0: load_world0(); break;
++    case 1: load_world1(); break;
++    case 2: load_world2(); break;
++    case 3: load_world3(); break;
++    case 4: load_world4(); break;
++    case 5: load_world5(); break;
++  }
++}
++
+@@ -1972,0 +2078,2 @@
++
++  export_frame();
+@@ -2638,0 +2746,29 @@
++
++  const char* export_path = NULL;
++  for (int i = 1; i < argc; i++) {
++    if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) {
++      export_path = argv[++i];
++    } else if (strcmp(argv[i], "--export-frames") == 0 && i + 1 < argc) {
++      char* end = NULL;
++      export_frame_limit = strtoull(argv[++i], &end, 10);
++      if (end == argv[i] || *end != '\0' || export_frame_limit == 0) {
++        fprintf(stderr, "--export-frames must be a positive integer\n");
++        return 2;
++      }
++    } else if (strcmp(argv[i], "--world") == 0 && i + 1 < argc) {
++      char* end = NULL;
++      const long world = strtol(argv[++i], &end, 10);
++      if (end == argv[i] || *end != '\0' || world < 0 || world > 5) {
++        fprintf(stderr, "--world must be an integer from 0 through 5\n");
++        return 2;
++      }
++      initial_world = (int)world;
++    } else {
++      fprintf(stderr, "Usage: %s [--export PATH] [--export-frames N] [--world 0..5]\n", argv[0]);
++      return 2;
++    }
++  }
++  if (export_frame_limit != 0 && export_path == NULL) {
++    fprintf(stderr, "--export-frames requires --export\n");
++    return 2;
++  }
+@@ -2713 +2849,3 @@
+-  load_world0();
++  load_world(initial_world);
++
++  if (export_path != NULL) { export_open(export_path); }
+@@ -2779,0 +2918,4 @@
++
++    if (export_frame_limit != 0 && export_frame_index >= export_frame_limit) {
++      running = false;
++    }
+@@ -2796,0 +2939,5 @@
++
++  if (export_stream != NULL) {
++    fclose(export_stream);
++    export_stream = NULL;
++  }
+@@ -2804 +2951 @@
+-}
+\ No newline at end of file
++}
