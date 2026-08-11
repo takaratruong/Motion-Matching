@@ -206,7 +206,9 @@ def test_lock_rejection_restores_snapshot_and_publishes_repaired_source(model) -
     assert processor.identity()["last_reason"] == "lock rejected"
 
 
-def test_repair_fallback_holds_only_on_raw_failure_then_recovers(model) -> None:
+def test_repair_fallback_bypasses_raw_failure_resets_lock_then_recovers(
+    model,
+) -> None:
     processor, repairer, locker = _processor(model)
     dt = 1.0 / 60.0
     processor.step(
@@ -233,16 +235,19 @@ def test_repair_fallback_holds_only_on_raw_failure_then_recovers(model) -> None:
     failed_target = _qpos(model, x=0.8, joint_offset=0.08)
     repairer.queue(False, reason="blend bad")
     repairer.queue(False, reason="raw bad")
-    held = processor.step(
+    bypassed = processor.step(
         failed_target,
         row=40,
         range_index=4,
         source_contact=np.asarray((True, False)),
         dt_s=dt,
     )
-    np.testing.assert_array_equal(held, fallback)
+    assert np.all(np.isfinite(bypassed))
     assert processor.raw_repair_failure_count == 1
+    assert processor.foot_lock_bypass_count == 1
     assert processor.identity()["last_reason"] == "raw bad"
+    assert len(locker.calls) == 2
+    assert locker.reset_calls == 2
 
     recovered_target = _qpos(model, x=0.85, joint_offset=0.09)
     recovered = processor.step(
@@ -252,11 +257,13 @@ def test_repair_fallback_holds_only_on_raw_failure_then_recovers(model) -> None:
         source_contact=np.asarray((True, False)),
         dt_s=dt,
     )
-    assert not np.array_equal(recovered, held)
+    assert not np.array_equal(recovered, bypassed)
     assert locker.calls[-1][1].tolist() == [True, False]
 
 
-def test_successor_raw_repair_failure_holds_without_duplicate_retry(model) -> None:
+def test_successor_raw_repair_failure_publishes_source_without_duplicate_retry(
+    model,
+) -> None:
     processor, repairer, _locker = _processor(model)
     displayed = processor.step(
         _qpos(model, x=0.0),
@@ -266,15 +273,17 @@ def test_successor_raw_repair_failure_holds_without_duplicate_retry(model) -> No
         dt_s=1.0 / 60.0,
     )
     repairer.queue(False, reason="raw successor rejected")
-    held = processor.step(
-        _qpos(model, x=0.1),
+    source = _qpos(model, x=0.1)
+    bypassed = processor.step(
+        source,
         row=2,
         range_index=0,
         source_contact=np.asarray((True, False)),
         dt_s=1.0 / 60.0,
     )
 
-    np.testing.assert_array_equal(held, displayed)
+    assert not np.array_equal(bypassed, displayed)
+    np.testing.assert_allclose(bypassed, source, atol=1.0e-6, rtol=0.0)
     assert len(repairer.calls) == 2
     assert processor.raw_repair_failure_count == 1
 
@@ -292,7 +301,7 @@ def test_initial_raw_repair_failure_bypasses_without_stall_then_recovers(model) 
         dt_s=1.0 / 60.0,
     )
 
-    np.testing.assert_array_equal(bypassed, initial)
+    np.testing.assert_allclose(bypassed, initial, atol=1.0e-7, rtol=0.0)
     assert locker.calls == []
     assert processor.raw_repair_failure_count == 1
     assert processor.identity()["last_reason"] == "initial raw rejected"

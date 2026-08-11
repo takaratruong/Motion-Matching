@@ -253,12 +253,21 @@ class ExistingUtilityPosePostprocessor:
             self.last_reason = str(
                 getattr(repaired, "reason", "raw source pose repair rejected")
             )
+            # Repair is an optional display correction.  A rejected correction
+            # must not freeze corpus playback: publish the inertialized source
+            # pose for this tick and reset any stale planted-foot anchors.
+            self.foot_locker.reset()
+            self.foot_lock_bypass_count += 1
+            displayed_qpos = build_qpos(
+                candidate.root_position_world,
+                candidate.root_orientation_world_xyzw,
+                candidate.joint_position,
+                self.model,
+            )
+            self._displayed_pose = candidate
+            self._displayed_qpos = displayed_qpos.copy()
             self._previous_row = row_value
             self._previous_range_index = range_value
-            if self._displayed_qpos is None:
-                self._displayed_pose = raw_target
-                self._displayed_qpos = np.array(qpos, dtype=np.float64, copy=True)
-                return self._displayed_qpos.copy()
             return self._displayed_qpos.copy()
 
         repaired_pose = repaired.pose
