@@ -13,6 +13,7 @@
 - Do not modify `sonic/python/mm_sonic/terrain_pfnn/runtime.py` or any checkpoint/dataset artifact.
 - Do not instantiate or call `HybridMatcher`, `ExistingUtilityPosePostprocessor`, pose repair, or foot locking in the PFNN viewer path.
 - Keep `command_driven_root=False`; PFNN owns planar root motion and learned support-relative root height.
+- Keep `hold_idle_pose=False`; neutral input must pass through PFNN rather than a viewer hold branch.
 - Preserve the complete PFNN root quaternion and all 29 emitted joints exactly after the existing IsaacLab-to-MuJoCo permutation.
 - Terrain model input and rendered mesh must come from the same loaded `SceneTerrainAdapter`.
 - Preserve the existing terrain-fit demo when `--scene` is absent; reject ambiguous simultaneous terrain authorities.
@@ -51,6 +52,8 @@
   premultiplied full quaternion, and the exact existing joint permutation.
   Assert no `display_joints_mujoco` override or `_blend_display_joints` call is
   used by `advance`.
+  Add a construction test proving `_load_runtime` passes
+  `command_driven_root=False` and `hold_idle_pose=False`.
 
 - [ ] **Step 4: Run exact-frame tests and verify RED**
 
@@ -69,7 +72,9 @@
   `_apply_frame` to use the complete frame quaternion and exact joint vector.
   Remove `_blend_display_joints` from the interactive advance path. Add optional
   CLI `--scene` and `--terrain-root`; reject `--scene` together with an explicit
-  `--terrain-fit`. Do not change `_load_runtime`.
+  `--terrain-fit`. Change only `_load_runtime`'s viewer-owned idle configuration
+  from `hold_idle_pose=True` to `hold_idle_pose=False`; otherwise leave PFNN
+  construction unchanged.
 
 - [ ] **Step 6: Run focused and full viewer tests**
 
@@ -120,4 +125,3 @@
   After an idle-GPU check, launch the exact committed viewer on the ramp, verify
   its MuJoCo window and expected GPU identity, and leave it running for the
   user. Do not inject controls or modify the process after readiness.
-

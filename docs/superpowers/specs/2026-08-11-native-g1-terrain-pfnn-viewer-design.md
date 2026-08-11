@@ -18,6 +18,8 @@ outputs of `TerrainPFNNRuntime`.  MuJoCo is only a renderer.
   command-owned root placement, support-plus-source-clearance placement, or a
   second inertializer.
 - Do not flatten the PFNN root quaternion or blend PFNN joints in the viewer.
+- Do not use the viewer's `hold_idle_pose` bypass; neutral input is evaluated by
+  PFNN so the trained recurrent model owns deceleration and the neutral pose.
 - Do not modify `terrain_pfnn/runtime.py`, the checkpoint, its normalization,
   recurrent state, phase update, trajectory planner, or output decoding.
 - Terrain samples supplied to PFNN and the mesh rendered by MuJoCo must come
@@ -28,7 +30,7 @@ outputs of `TerrainPFNNRuntime`.  MuJoCo is only a renderer.
 ## Existing authorities
 
 - Runtime: `mm_sonic.terrain_pfnn.runtime.TerrainPFNNRuntime` with
-  `command_driven_root=False`.
+  `command_driven_root=False` and `hold_idle_pose=False`.
 - Model: the accepted native-G1 rollout checkpoint
   `model-mixed-filtered-rollout16-final-v2/best.pt`.
 - Dataset: `mixed-corpus-filtered/manifest.json`, which contains flat,
@@ -65,4 +67,3 @@ Supplying both is rejected so the terrain authority cannot be ambiguous.
 - A bounded headless ramp and stair run uses the frozen checkpoint and reports
   finite model frames, model-owned root motion, phase advancement, and no hold.
 - The visible viewer is launched on the ramp for operator inspection.
-
