@@ -44,9 +44,11 @@ DIAGNOSTIC_MODEL_LABEL = (
     "HYBRID TERRAIN LMM POC (DIAGNOSTIC UNVERIFIED GENERATOR; NOT ACCEPTANCE EVIDENCE)"
 )
 _DISPLAY_POSTPROCESSOR_IDENTITY = (
-    "existing-pose-inertializer-repair-transition-guard/v3"
+    "existing-pose-inertializer-repair-measured-continuous-foot-lock/v4"
 )
-_DISPLAY_POSTPROCESSOR_POLICY = "PoseInertializer + G1TerrainTransitionGuard"
+_DISPLAY_POSTPROCESSOR_POLICY = (
+    "PoseInertializer + measured continuous G1TerrainFootLock"
+)
 _FORMAL_ARTIFACT_AUTHORITIES = {
     "cache_manifest_sha256": (
         "084c168b473e730ec24419a49f4be1526226e5f95a2dd81ae4d367c729889cdb"
@@ -1090,18 +1092,26 @@ def _display_postprocessor_overlay(identity: object | None) -> tuple[str, str]:
     if getter("diagnostic_display_postprocessor") != _DISPLAY_POSTPROCESSOR_IDENTITY:
         return "", ""
     half_life = float(getter("inertialization_halflife_s"))
-    hold_frames = int(getter("entry_contact_hold_frames", 0))
-    source_tracking = "on" if bool(getter("track_source_contacts", False)) else "off"
+    speed = float(getter("measured_stance_maximum_foot_speed_mps", 0.20))
+    clearance = float(getter("measured_stance_maximum_sole_clearance_m", 0.020))
+    acquire = int(getter("measured_stance_acquire_frames", 2))
+    stance = tuple(getter("last_measured_stance_contact", (False, False)))
     title = f"{_DISPLAY_POSTPROCESSOR_POLICY} | {half_life:.2f}s half-life"
     body = (
         f"display postprocess {_DISPLAY_POSTPROCESSOR_POLICY} | "
         f"{half_life:.2f}s half-life | "
-        f"measured support hold {hold_frames}f | "
-        f"source tracking {source_tracking} | "
+        f"measured stance <= {speed:.2f} m/s, "
+        f"{1000.0 * clearance:.0f} mm, {acquire}f | "
+        "source labels ignored for locking | "
+        f"stance L/R {int(bool(stance[0]))}/{int(bool(stance[1]))} | "
         f"repair calls accepted {int(getter('pose_repair_count', 0))} | "
-        "entry lock published/bypassed "
-        f"{int(getter('foot_lock_accept_count', 0))}/"
-        f"{int(getter('foot_lock_bypass_count', 0))} | "
+        "continuous active/releasing/idle "
+        f"{int(getter('continuous_lock_active_frame_count', 0))}/"
+        f"{int(getter('continuous_lock_releasing_frame_count', 0))}/"
+        f"{int(getter('continuous_lock_idle_frame_count', 0))} | "
+        "recovery/bypass "
+        f"{int(getter('continuous_lock_recovery_count', 0))}/"
+        f"{int(getter('continuous_lock_bypass_count', 0))} | "
         f"repair rejected {int(getter('pose_repair_rejection_count', 0))} | "
         f"last reason {getter('last_reason', 'none')}\n"
     )

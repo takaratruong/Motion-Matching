@@ -24,7 +24,7 @@ from .terrain_catalog import (
     JUSTIN_STAIR_RUN_M,
     JUSTIN_STAIR_TREADS,
 )
-from .terrain_scene import FourWayPlatformScene, StairPlacement
+from .terrain_scene import StairPlacement
 
 
 _FOOT_BODY_NAMES = ("left_ankle_roll_link", "right_ankle_roll_link")
@@ -1222,7 +1222,14 @@ class G1TerrainTransitionGuard:
         track_source_contacts: bool = False,
         source_contact_delay_frames: int = 30,
         dt_s: float = 1.0 / 50.0,
+        landing_maximum_foot_speed_mps: float = 0.20,
+        landing_maximum_sole_clearance_m: float = 0.020,
+        landing_contact_acquire_frames: int = 2,
+        landing_minimum_swing_clearance_m: float = 0.012,
     ) -> None:
+        landing_speed = float(landing_maximum_foot_speed_mps)
+        landing_clearance = float(landing_maximum_sole_clearance_m)
+        swing_clearance = float(landing_minimum_swing_clearance_m)
         if (
             type(contact_hold_frames) is not int
             or contact_hold_frames <= 0
@@ -1231,6 +1238,14 @@ class G1TerrainTransitionGuard:
             or source_contact_delay_frames < contact_hold_frames
             or not math.isfinite(float(dt_s))
             or float(dt_s) <= 0.0
+            or not math.isfinite(landing_speed)
+            or landing_speed <= 0.0
+            or not math.isfinite(landing_clearance)
+            or landing_clearance < 0.0
+            or type(landing_contact_acquire_frames) is not int
+            or landing_contact_acquire_frames <= 0
+            or not math.isfinite(swing_clearance)
+            or swing_clearance < 0.0
             or not callable(getattr(pose_repairer, "repair", None))
             or not callable(getattr(foot_locker, "apply", None))
             or not callable(getattr(foot_locker, "reset", None))
@@ -1248,6 +1263,10 @@ class G1TerrainTransitionGuard:
         self.track_source_contacts = track_source_contacts
         self.source_contact_delay_frames = source_contact_delay_frames
         self.dt_s = float(dt_s)
+        self.landing_maximum_foot_speed_mps = landing_speed
+        self.landing_maximum_sole_clearance_m = landing_clearance
+        self.landing_contact_acquire_frames = landing_contact_acquire_frames
+        self.landing_minimum_swing_clearance_m = swing_clearance
         self.last_pose_repair_result: object | None = None
         self.last_foot_lock_result: object | None = None
         self.end_stair()
@@ -1259,6 +1278,24 @@ class G1TerrainTransitionGuard:
     @property
     def entry_lock_active(self) -> bool:
         return self._entry_lock_active
+
+    @property
+    def measured_stance_contact(self) -> tuple[bool, bool]:
+        """Return the last debounced measured landing-stance decision."""
+
+        return self._landing_contact
+
+    @property
+    def landing_filter_outcome(self) -> str:
+        """Return the last continuous landing-filter outcome."""
+
+        return self._landing_filter_outcome
+
+    @property
+    def landing_filter_reason(self) -> str:
+        """Return the last continuous landing-filter diagnostic reason."""
+
+        return self._landing_filter_reason
 
     def support_contact(self, pose: KinematicPose) -> np.ndarray:
         """Expose the measured support phase for entry matching."""
@@ -1339,6 +1376,8 @@ class G1TerrainTransitionGuard:
         self._landing_touchdown_frames = [0, 0]
         self._landing_supported_feet = [False, False]
         self._landing_side = "top"
+        self._landing_filter_outcome = "reset"
+        self._landing_filter_reason = "reset"
         self.last_pose_repair_result = None
         self.last_foot_lock_result = None
 
@@ -1364,24 +1403,58 @@ class G1TerrainTransitionGuard:
             raise ValueError(
                 "terrain foot locker cannot classify landing stance"
             )
-        contact = np.asarray(contact_method(pose), dtype=bool)
+        contact = np.asarray(
+            contact_method(
+                pose,
+                maximum_foot_speed_mps=(
+                    self.landing_maximum_foot_speed_mps
+                ),
+                maximum_sole_clearance_m=(
+                    self.landing_maximum_sole_clearance_m
+                ),
+            ),
+            dtype=bool,
+        )
         self._landing_previous_pose = pose
         self._landing_contact = (
             bool(contact[0]),
             bool(contact[1]),
         )
         self._landing_touchdown_frames = [
-            2 if bool(value) else 0 for value in contact
+            (
+                self.landing_contact_acquire_frames
+                if bool(value)
+                else 0
+            )
+            for value in contact
         ]
         seeded = self.foot_locker.apply(
             pose,
             contact,
             dt_s=self.dt_s,
-            minimum_swing_clearance_m=0.012,
+            minimum_swing_clearance_m=(
+                self.landing_minimum_swing_clearance_m
+            ),
         )
         self.last_foot_lock_result = seeded
         if not bool(getattr(seeded, "accepted", False)):
+            self._landing_filter_outcome = "prime-rejected"
+            self._landing_filter_reason = str(
+                getattr(seeded, "reason", "foot lock prime rejected")
+            )
             self.foot_locker.reset()
+            return
+        self._landing_filter_outcome = (
+            "primed-active"
+            if any(
+                bool(value)
+                for value in getattr(seeded, "locked", ())
+            )
+            else "primed-idle"
+        )
+        self._landing_filter_reason = str(
+            getattr(seeded, "reason", "accepted")
+        )
 
     def filter_landing(
         self, pose: KinematicPose
@@ -1394,6 +1467,10 @@ class G1TerrainTransitionGuard:
         self.last_pose_repair_result = repair
         self.last_foot_lock_result = None
         if not bool(getattr(repair, "accepted", False)):
+            self._landing_filter_outcome = "repair-rejected"
+            self._landing_filter_reason = str(
+                getattr(repair, "reason", "pose repair rejected")
+            )
             return None
         candidate = getattr(repair, "pose", None)
         if not isinstance(candidate, KinematicPose):
@@ -1414,7 +1491,16 @@ class G1TerrainTransitionGuard:
             }
         )
         raw_contact = np.asarray(
-            contact_method(candidate, **contact_kwargs),
+            contact_method(
+                candidate,
+                maximum_foot_speed_mps=(
+                    self.landing_maximum_foot_speed_mps
+                ),
+                maximum_sole_clearance_m=(
+                    self.landing_maximum_sole_clearance_m
+                ),
+                **contact_kwargs,
+            ),
             dtype=bool,
         )
         self._landing_previous_pose = candidate
@@ -1423,12 +1509,15 @@ class G1TerrainTransitionGuard:
             if self._landing_contact[foot]:
                 contact_values[foot] = bool(raw_contact[foot])
                 self._landing_touchdown_frames[foot] = (
-                    2 if contact_values[foot] else 0
+                    self.landing_contact_acquire_frames
+                    if contact_values[foot]
+                    else 0
                 )
             elif bool(raw_contact[foot]):
                 self._landing_touchdown_frames[foot] += 1
                 contact_values[foot] = (
-                    self._landing_touchdown_frames[foot] >= 2
+                    self._landing_touchdown_frames[foot]
+                    >= self.landing_contact_acquire_frames
                 )
             else:
                 self._landing_touchdown_frames[foot] = 0
@@ -1441,10 +1530,15 @@ class G1TerrainTransitionGuard:
             candidate,
             contact,
             dt_s=self.dt_s,
-            minimum_swing_clearance_m=0.012,
+            minimum_swing_clearance_m=(
+                self.landing_minimum_swing_clearance_m
+            ),
         )
         self.last_foot_lock_result = locked
         if not bool(getattr(locked, "accepted", False)):
+            rejected_reason = str(
+                getattr(locked, "reason", "foot lock rejected")
+            )
             # Do not drop a saturated stance correction in one frame.  The
             # lock update is transactional, so retry the same pose with both
             # contacts released.  This starts the existing inertialized
@@ -1454,7 +1548,9 @@ class G1TerrainTransitionGuard:
                 candidate,
                 np.zeros(2, dtype=bool),
                 dt_s=self.dt_s,
-                minimum_swing_clearance_m=0.012,
+                minimum_swing_clearance_m=(
+                    self.landing_minimum_swing_clearance_m
+                ),
             )
             self.last_foot_lock_result = released
             if not bool(getattr(released, "accepted", False)):
@@ -1462,14 +1558,46 @@ class G1TerrainTransitionGuard:
                 # collision-safe source advancing if even release is
                 # infeasible rather than replaying one landing frame forever.
                 self.foot_locker.reset()
+                self._landing_filter_outcome = (
+                    "bypass-after-double-reject"
+                )
+                self._landing_filter_reason = (
+                    f"{rejected_reason}; release rejected: "
+                    f"{getattr(released, 'reason', 'foot lock rejected')}"
+                )
                 return candidate
             locked = released
+            self._landing_filter_outcome = "release-after-reject"
+            self._landing_filter_reason = rejected_reason
+        elif any(
+            bool(value) for value in getattr(locked, "locked", ())
+        ):
+            self._landing_filter_outcome = "active"
+            self._landing_filter_reason = str(
+                getattr(locked, "reason", "accepted")
+            )
+        elif any(
+            bool(value) for value in getattr(locked, "releasing", ())
+        ):
+            self._landing_filter_outcome = "releasing"
+            self._landing_filter_reason = str(
+                getattr(locked, "reason", "accepted")
+            )
+        else:
+            self._landing_filter_outcome = "idle"
+            self._landing_filter_reason = str(
+                getattr(locked, "reason", "accepted")
+            )
         filtered = getattr(locked, "pose", None)
         if not isinstance(filtered, KinematicPose):
             raise ValueError("foot locker returned an invalid pose")
         post = self.pose_repairer.repair(filtered)
         self.last_pose_repair_result = post
         if not bool(getattr(post, "accepted", False)):
+            self._landing_filter_outcome = "post-repair-rejected"
+            self._landing_filter_reason = str(
+                getattr(post, "reason", "post-lock pose repair rejected")
+            )
             return None
         result = getattr(post, "pose", None)
         if not isinstance(result, KinematicPose):

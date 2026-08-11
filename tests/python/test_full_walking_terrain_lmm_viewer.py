@@ -794,7 +794,7 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
         [False, False, False, False, False, True, False],
     )
     label = fake_run_interactive(matcher, adapter, **call)["label"]
-    assert "PoseInertializer + G1TerrainTransitionGuard" in label
+    assert "PoseInertializer + measured continuous G1TerrainFootLock" in label
     assert "0.10s half-life" in label
 
 
@@ -1184,7 +1184,7 @@ def test_full_stability_label_reports_mechanical_filter_inventory(
     assert ("CANONICAL SOURCE POSES" in label) is canonical_source
     assert "LEG SEARCH" not in label
     assert "ARM SLEW" not in label
-    assert "PoseInertializer + G1TerrainTransitionGuard" in label
+    assert "PoseInertializer + measured continuous G1TerrainFootLock" in label
     assert "0.10s half-life" in label
     assert "NOT ACCEPTANCE EVIDENCE" in label
 

@@ -15,7 +15,7 @@ from .terrain_oracle.math3d import angular_velocity_world_wxyz
 from .terrain_pose_repair import G1TerrainPoseRepair
 
 
-_IDENTITY = "existing-pose-inertializer-repair-transition-guard/v3"
+_IDENTITY = "existing-pose-inertializer-repair-measured-continuous-foot-lock/v4"
 
 
 class _ObservedPoseRepairer:
@@ -199,10 +199,18 @@ class ExistingUtilityPosePostprocessor:
         self._displayed_qpos: np.ndarray | None = None
         self._previous_row: int | None = None
         self._previous_range_index: int | None = None
+        self._continuous_lock_started = False
         self.pose_repair_count = 0
         self.foot_lock_accept_count = 0
         self.foot_lock_bypass_count = 0
         self.pose_repair_rejection_count = 0
+        self.continuous_lock_active_frame_count = 0
+        self.continuous_lock_releasing_frame_count = 0
+        self.continuous_lock_idle_frame_count = 0
+        self.continuous_lock_recovery_count = 0
+        self.continuous_lock_bypass_count = 0
+        self.last_measured_stance_contact = (False, False)
+        self.last_pose_repair_rejection: dict[str, float] | None = None
         self.last_reason = "reset"
 
     def _record_pose_repair(self, result: object) -> None:
@@ -210,7 +218,33 @@ class ExistingUtilityPosePostprocessor:
             self.pose_repair_count += 1
             return
         self.pose_repair_rejection_count += 1
-        self.last_reason = str(getattr(result, "reason", "pose repair rejected"))
+        metrics: dict[str, float] = {}
+        for name in (
+            "maximum_forbidden_penetration_after_m",
+            "maximum_foot_penetration_after_m",
+            "maximum_joint_delta_rad",
+        ):
+            try:
+                value = float(getattr(result, name))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                metrics[name] = value
+        self.last_pose_repair_rejection = metrics or None
+        explicit_reason = getattr(result, "reason", None)
+        if isinstance(explicit_reason, str) and explicit_reason:
+            self.last_reason = explicit_reason
+        elif metrics:
+            self.last_reason = (
+                "pose repair rejected: forbidden "
+                f"{metrics.get('maximum_forbidden_penetration_after_m', math.nan):.6f} m; "
+                "foot "
+                f"{metrics.get('maximum_foot_penetration_after_m', math.nan):.6f} m; "
+                "joint "
+                f"{metrics.get('maximum_joint_delta_rad', math.nan):.6f} rad"
+            )
+        else:
+            self.last_reason = "pose repair rejected"
 
     @staticmethod
     def _index(value: object, name: str) -> int:
@@ -257,7 +291,6 @@ class ExistingUtilityPosePostprocessor:
                 halflife_s=self.inertialization_halflife_s,
             )
             self._inertializer_elapsed_s = 0.0
-            self.transition_guard.begin_entry()
         elif self._inertializer is not None:
             self._inertializer_elapsed_s += step
 
@@ -269,37 +302,51 @@ class ExistingUtilityPosePostprocessor:
                 raw_target, elapsed_s=self._inertializer_elapsed_s
             )
         )
-        snapshot = self.transition_guard.snapshot_state()
-        displayed_pose = self.transition_guard(candidate, contacts)
-        repair_result = self.transition_guard.last_pose_repair_result
+        # Corpus contacts remain part of the caller ABI and are validated
+        # above, but they never authorize a display lock.  Prime the existing
+        # measured landing classifier once after reset, then preserve its
+        # world-space stance targets across motion-match transitions.
+        if not self._continuous_lock_started:
+            self.transition_guard.begin_landing(candidate)
+            self._continuous_lock_started = True
+        displayed_pose = self.transition_guard.filter_landing(candidate)
         lock_result = self.transition_guard.last_foot_lock_result
+        outcome = self.transition_guard.landing_filter_outcome
+        self.last_measured_stance_contact = (
+            self.transition_guard.measured_stance_contact
+        )
         if displayed_pose is None:
+            self.continuous_lock_bypass_count += 1
             if lock_result is not None:
                 self.foot_lock_bypass_count += 1
-            if not bool(getattr(repair_result, "accepted", False)):
-                # Repair is an optional display correction. A rejected initial
-                # or post-lock repair must never freeze corpus playback.
-                self.transition_guard.reset()
-                displayed_pose = candidate
-            else:
-                # A first-frame entry lock rejection is transactional: retain
-                # the armed measured-support entry and publish the safe repair.
-                self.transition_guard.restore_state(snapshot)
-                displayed_pose = getattr(repair_result, "pose", None)
-                self.last_reason = str(
-                    getattr(lock_result, "reason", "foot lock rejected")
-                )
+            # A pre-lock or post-lock repair rejection must not freeze source
+            # playback.  A post-lock rejection may already have committed a
+            # target for an unpublished pose, so clear every landing temporal
+            # field and re-prime from a later advancing candidate.
+            self.transition_guard.reset()
+            self._continuous_lock_started = False
+            displayed_pose = candidate
         elif lock_result is not None:
             if bool(getattr(lock_result, "accepted", False)):
                 self.foot_lock_accept_count += 1
             else:
                 self.foot_lock_bypass_count += 1
-                self.last_reason = str(
-                    getattr(lock_result, "reason", "foot lock rejected")
-                )
+
+        if outcome == "active":
+            self.continuous_lock_active_frame_count += 1
+        elif outcome in {"releasing", "release-after-reject"}:
+            self.continuous_lock_releasing_frame_count += 1
+        elif outcome == "idle":
+            self.continuous_lock_idle_frame_count += 1
+        if outcome == "release-after-reject":
+            self.continuous_lock_recovery_count += 1
+            self.last_reason = self.transition_guard.landing_filter_reason
+        elif outcome == "bypass-after-double-reject":
+            self.continuous_lock_bypass_count += 1
+            self.last_reason = self.transition_guard.landing_filter_reason
 
         if not isinstance(displayed_pose, KinematicPose):
-            raise ValueError("terrain transition guard returned an invalid pose")
+            raise ValueError("terrain continuous foot lock returned an invalid pose")
 
         displayed_qpos = build_qpos(
             displayed_pose.root_position_world,
@@ -319,16 +366,43 @@ class ExistingUtilityPosePostprocessor:
         return {
             "diagnostic_display_postprocessor": _IDENTITY,
             "inertialization_halflife_s": self.inertialization_halflife_s,
-            "entry_contact_hold_frames": self.transition_guard.contact_hold_frames,
-            "track_source_contacts": self.transition_guard.track_source_contacts,
-            "source_contact_delay_frames": (
-                self.transition_guard.source_contact_delay_frames
+            "contact_policy": "measured-support-speed-hysteresis",
+            "source_contacts_used_for_locking": False,
+            "measured_stance_maximum_foot_speed_mps": (
+                self.transition_guard.landing_maximum_foot_speed_mps
             ),
-            "transition_guard_dt_s": self.transition_guard.dt_s,
+            "measured_stance_maximum_sole_clearance_m": (
+                self.transition_guard.landing_maximum_sole_clearance_m
+            ),
+            "measured_stance_acquire_frames": (
+                self.transition_guard.landing_contact_acquire_frames
+            ),
+            "minimum_swing_clearance_m": (
+                self.transition_guard.landing_minimum_swing_clearance_m
+            ),
+            "foot_lock_release_halflife_s": float(
+                getattr(self.foot_locker, "release_halflife_s", 0.08)
+            ),
+            "continuous_lock_dt_s": self.transition_guard.dt_s,
             "pose_repair_count": self.pose_repair_count,
             "foot_lock_accept_count": self.foot_lock_accept_count,
             "foot_lock_bypass_count": self.foot_lock_bypass_count,
             "pose_repair_rejection_count": self.pose_repair_rejection_count,
+            "continuous_lock_active_frame_count": (
+                self.continuous_lock_active_frame_count
+            ),
+            "continuous_lock_releasing_frame_count": (
+                self.continuous_lock_releasing_frame_count
+            ),
+            "continuous_lock_idle_frame_count": (self.continuous_lock_idle_frame_count),
+            "continuous_lock_recovery_count": (self.continuous_lock_recovery_count),
+            "continuous_lock_bypass_count": (self.continuous_lock_bypass_count),
+            "last_measured_stance_contact": (self.last_measured_stance_contact),
+            "last_pose_repair_rejection": (
+                None
+                if self.last_pose_repair_rejection is None
+                else dict(self.last_pose_repair_rejection)
+            ),
             "last_reason": self.last_reason,
         }
 
