@@ -8,6 +8,7 @@ from unittest import mock
 
 import numpy as np
 
+from mm_sonic.terrain_pfnn import features as pfnn_features
 from mm_sonic.build_g1_pfnn_vertical_dataset import (
     VERTICAL_DATASET_SCHEMA,
     VerticalSliceSource,
@@ -31,7 +32,16 @@ from mm_sonic.terrain_pfnn.layout import (
 )
 from mm_sonic.terrain_pfnn.phase import ContactPhaseTrack
 from mm_sonic.terrain_pfnn.sources import PFNNSourceClip
-from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
+from mm_sonic.terrain_oracle.canonical import (
+    ISAACLAB_BODY_NAMES,
+    ISAACLAB_JOINT_NAMES,
+)
+
+
+_LEFT_HIP_BODY = ISAACLAB_BODY_NAMES.index("left_hip_pitch_link")
+_RIGHT_HIP_BODY = ISAACLAB_BODY_NAMES.index("right_hip_pitch_link")
+_LEFT_SHOULDER_BODY = ISAACLAB_BODY_NAMES.index("left_shoulder_pitch_link")
+_RIGHT_SHOULDER_BODY = ISAACLAB_BODY_NAMES.index("right_shoulder_pitch_link")
 
 
 def _clip(
@@ -40,13 +50,25 @@ def _clip(
     joint_offset: float = 0.0,
     stateful_joints: bool = False,
     unsafe_frame: int | None = None,
+    body_yaw: float = 0.0,
+    pelvis_yaw: float = 0.0,
 ) -> PFNNSourceClip:
     frames = 100
     root = np.zeros((frames, 3), dtype=np.float32)
     root[:, 0] = np.linspace(0.0, 1.0, frames, dtype=np.float32)
     root[:, 2] = 0.8
-    root_quaternion = np.zeros((frames, 4), dtype=np.float32)
-    root_quaternion[:, 0] = 1.0
+    root_quaternion = np.tile(
+        np.array(
+            (
+                np.cos(pelvis_yaw / 2.0),
+                0.0,
+                0.0,
+                np.sin(pelvis_yaw / 2.0),
+            ),
+            dtype=np.float32,
+        ),
+        (frames, 1),
+    )
     joint = np.full((frames, 29), joint_offset, dtype=np.float32)
     joint_velocity = np.zeros_like(joint)
     if stateful_joints:
@@ -64,6 +86,15 @@ def _clip(
         joint[unsafe_frame:, 7] += np.float32(0.225001)
     body = np.repeat(root[:, None, :], 30, axis=1)
     body[:, :, 2] += np.linspace(0.0, 0.4, 30, dtype=np.float32)
+    across = np.array((-np.sin(body_yaw), np.cos(body_yaw)), dtype=np.float32)
+    for left, right, half_width, height in (
+        (_LEFT_HIP_BODY, _RIGHT_HIP_BODY, 0.12, -0.05),
+        (_LEFT_SHOULDER_BODY, _RIGHT_SHOULDER_BODY, 0.20, 0.45),
+    ):
+        body[:, left, :2] = root[:, :2] + half_width * across
+        body[:, right, :2] = root[:, :2] - half_width * across
+        body[:, left, 2] = root[:, 2] + height
+        body[:, right, 2] = root[:, 2] + height
     body_quaternion = np.zeros((frames, 30, 4), dtype=np.float32)
     body_quaternion[:, :, 0] = 1.0
     linear = np.zeros_like(body)
@@ -120,6 +151,8 @@ def _source(
     joint_offset: float = 0.0,
     stateful_joints: bool = False,
     unsafe_frame: int | None = None,
+    body_yaw: float = 0.0,
+    pelvis_yaw: float = 0.0,
 ) -> VerticalSliceSource:
     return VerticalSliceSource(
         role=role,
@@ -130,6 +163,8 @@ def _source(
             joint_offset=joint_offset,
             stateful_joints=stateful_joints,
             unsafe_frame=unsafe_frame,
+            body_yaw=body_yaw,
+            pelvis_yaw=pelvis_yaw,
         ),
         phase_track=_phase(),
         segments=(
@@ -146,6 +181,62 @@ def _source(
 
 
 class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
+    def test_root_world_yaw_uses_the_same_body_facing_as_feature_rows(self) -> None:
+        body_yaw = np.pi / 3.0
+        train_source = _source(
+            "train",
+            "released_train",
+            body_yaw=body_yaw,
+            pelvis_yaw=-0.4,
+        )
+        dataset = build_vertical_dataset(
+            (train_source, _source("validation", "released_val"))
+        )
+        facing_function = getattr(
+            pfnn_features, "smoothed_body_facing_yaw_world", None
+        )
+        self.assertTrue(
+            callable(facing_function),
+            "vertical metadata and feature rows need one shared facing helper",
+        )
+        expected_yaw = facing_function(train_source.clip)
+        train = dataset.splits["train"]
+        base_indices = np.flatnonzero(~train.mirrored)
+        for index in base_indices:
+            frame = (
+                int(train.center_frame_120hz[index])
+                - train_source.source_start_frame_120hz
+            ) // 4
+            self.assertAlmostEqual(
+                float(train.root_world_yaw[index]), float(expected_yaw[frame]), places=6
+            )
+            direction = train.x[
+                index, INPUT_LAYOUT["trajectory_direction"]
+            ].reshape(12, 2)
+            np.testing.assert_allclose(
+                direction, np.tile((1.0, 0.0), (12, 1)), atol=1.0e-6
+            )
+
+            mirrored = np.flatnonzero(
+                train.mirrored
+                & (train.center_frame_120hz == train.center_frame_120hz[index])
+                & (train.sequence_lane == train.sequence_lane[index])
+            )
+            self.assertEqual(len(mirrored), 1)
+            mirror_index = int(mirrored[0])
+            self.assertEqual(
+                float(train.root_world_yaw[mirror_index]),
+                float(train.root_world_yaw[index]),
+            )
+            mirrored_direction = train.x[
+                mirror_index, INPUT_LAYOUT["trajectory_direction"]
+            ].reshape(12, 2)
+            np.testing.assert_allclose(
+                mirrored_direction,
+                np.tile((1.0, 0.0), (12, 1)),
+                atol=1.0e-6,
+            )
+
     def test_v3_rows_append_exact_source_q_and_qdot_in_isaaclab_order(self) -> None:
         train_source = _source(
             "train", "released_train", stateful_joints=True

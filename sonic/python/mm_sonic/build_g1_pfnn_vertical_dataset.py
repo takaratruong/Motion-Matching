@@ -29,6 +29,7 @@ from mm_sonic.terrain_pfnn.features import (
     PFNNTrainingWindow,
     build_clip_windows_with_audit,
     mirror_window,
+    smoothed_body_facing_yaw_world,
 )
 from mm_sonic.terrain_pfnn.dataset import (
     mirror_classic_g1_joint_state,
@@ -388,6 +389,7 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
         source.stem: source.clip.joint_velocity_source for source in ordered
     }
     for source in ordered:
+        facing_yaw_world = smoothed_body_facing_yaw_world(source.clip)
         if source.clip.joint_velocity_source == "unique_predecessor":
             expected_velocity = _backward_finite_difference(
                 source.clip.joint_position, source.clip.fps
@@ -420,16 +422,7 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
                     source.clip.root_position_world[window.center_frame, :2],
                     dtype=np.float64,
                 )
-                w, x, y, z = np.asarray(
-                    source.clip.root_quaternion_world_wxyz[window.center_frame],
-                    dtype=np.float64,
-                )
-                root_yaw = float(
-                    np.arctan2(
-                        2.0 * (w * z + x * y),
-                        1.0 - 2.0 * (y * y + z * z),
-                    )
-                )
+                root_yaw = float(facing_yaw_world[window.center_frame])
                 joint_position = source.clip.joint_position[window.center_frame]
                 joint_velocity = source.clip.joint_velocity[window.center_frame]
                 transition = np.abs(

@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import math
+import subprocess
+import sys
 import unittest
 
 import numpy as np
 
+from mm_sonic.terrain_pfnn import features as pfnn_features
 from mm_sonic.terrain_oracle.canonical import (
     ISAACLAB_BODY_NAMES,
     ISAACLAB_JOINT_NAMES,
@@ -42,6 +45,74 @@ JOINT_MIRROR_SIGNS = np.asarray(
      -1, -1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1),
     dtype=np.float32,
 )
+_LEFT_HIP_BODY = ISAACLAB_BODY_NAMES.index("left_hip_pitch_link")
+_RIGHT_HIP_BODY = ISAACLAB_BODY_NAMES.index("right_hip_pitch_link")
+_LEFT_SHOULDER_BODY = ISAACLAB_BODY_NAMES.index("left_shoulder_pitch_link")
+_RIGHT_SHOULDER_BODY = ISAACLAB_BODY_NAMES.index("right_shoulder_pitch_link")
+
+
+def _body_offsets_local() -> np.ndarray:
+    offsets = np.zeros((30, 3), dtype=np.float32)
+    offsets[:, 0] = np.arange(30, dtype=np.float32) * 0.01
+    offsets[:, 1] = np.arange(30, dtype=np.float32) * -0.02
+    offsets[:, 2] = np.arange(30, dtype=np.float32) * 0.005
+    for left, right, half_width in (
+        (_LEFT_HIP_BODY, _RIGHT_HIP_BODY, 0.12),
+        (_LEFT_SHOULDER_BODY, _RIGHT_SHOULDER_BODY, 0.20),
+    ):
+        pair_center = 0.5 * (offsets[left] + offsets[right])
+        offsets[left] = pair_center + np.array((0.0, half_width, 0.0))
+        offsets[right] = pair_center - np.array((0.0, half_width, 0.0))
+    return offsets
+
+
+def _with_body_facing(clip: PFNNSourceClip, yaw: np.ndarray) -> PFNNSourceClip:
+    yaw_trace = np.asarray(yaw, dtype=np.float64)
+    if yaw_trace.shape != (clip.frame_count,):
+        raise ValueError("yaw must have one value per frame")
+    across = np.column_stack((-np.sin(yaw_trace), np.cos(yaw_trace)))
+    body = np.array(clip.body_position_world, copy=True)
+    root = np.asarray(clip.root_position_world)
+    for left, right, half_width, height in (
+        (_LEFT_HIP_BODY, _RIGHT_HIP_BODY, 0.12, -0.05),
+        (_LEFT_SHOULDER_BODY, _RIGHT_SHOULDER_BODY, 0.20, 0.45),
+    ):
+        body[:, left, :2] = root[:, :2] + half_width * across
+        body[:, right, :2] = root[:, :2] - half_width * across
+        body[:, left, 2] = root[:, 2] + height
+        body[:, right, 2] = root[:, 2] + height
+    return replace(clip, body_position_world=body)
+
+
+def _holden_reference_facing_yaw(clip: PFNNSourceClip) -> np.ndarray:
+    """Literal released PFNN facing recipe, converted from y-up to G1 z-up."""
+
+    g1 = np.asarray(clip.body_position_world, dtype=np.float64)
+    source_y_up = np.stack((g1[..., 0], g1[..., 2], -g1[..., 1]), axis=-1)
+    across = (
+        source_y_up[:, _LEFT_SHOULDER_BODY]
+        - source_y_up[:, _RIGHT_SHOULDER_BODY]
+        + source_y_up[:, _LEFT_HIP_BODY]
+        - source_y_up[:, _RIGHT_HIP_BODY]
+    )
+    across /= np.linalg.norm(across, axis=1, keepdims=True)
+    forward = np.cross(across, np.array((0.0, 1.0, 0.0)))
+
+    # Holden uses sigma=20 at 120 Hz. PFNNSourceClip is sealed at 30 Hz, so
+    # sigma=5 preserves the same temporal width. scipy's default radius is
+    # round(4*sigma), and mode="nearest" clamps samples at both clip edges.
+    sigma = 20.0 * clip.fps / 120.0
+    radius = int(4.0 * sigma + 0.5)
+    offsets = np.arange(-radius, radius + 1)
+    weights = np.exp(-0.5 * (offsets / sigma) ** 2)
+    weights /= np.sum(weights)
+    smoothed = np.empty_like(forward)
+    for frame in range(clip.frame_count):
+        indices = np.clip(frame + offsets, 0, clip.frame_count - 1)
+        smoothed[frame] = weights @ forward[indices]
+    smoothed /= np.linalg.norm(smoothed, axis=1, keepdims=True)
+    forward_g1 = np.column_stack((smoothed[:, 0], -smoothed[:, 2]))
+    return np.arctan2(forward_g1[:, 1], forward_g1[:, 0])
 
 
 def _quaternion_yaw_roll(yaw: float, roll: float = 0.0) -> np.ndarray:
@@ -104,10 +175,7 @@ def _fixture(
     root_position[:, 2] = surface.height_at(root_position[:, :2]) + 1.0
     quaternion = np.tile(_quaternion_yaw_roll(yaw, roll), (frames, 1))
 
-    body_offsets_local = np.zeros((30, 3), dtype=np.float32)
-    body_offsets_local[:, 0] = np.arange(30, dtype=np.float32) * 0.01
-    body_offsets_local[:, 1] = np.arange(30, dtype=np.float32) * -0.02
-    body_offsets_local[:, 2] = np.arange(30, dtype=np.float32) * 0.005
+    body_offsets_local = _body_offsets_local()
     rotation = np.array(
         ((math.cos(yaw), -math.sin(yaw)),
          (math.sin(yaw), math.cos(yaw))),
@@ -205,6 +273,110 @@ class SplitIdentityTest(unittest.TestCase):
 
 
 class TrainingWindowTest(unittest.TestCase):
+    def test_features_module_stays_importable_without_optional_scipy(self) -> None:
+        program = """
+import builtins
+import mm_sonic.terrain_pfnn.layout
+
+original_import = builtins.__import__
+
+def import_without_scipy(name, *args, **kwargs):
+    if name == "scipy" or name.startswith("scipy."):
+        raise ModuleNotFoundError("scipy is intentionally unavailable")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = import_without_scipy
+import mm_sonic.terrain_pfnn.features
+"""
+        result = subprocess.run(
+            (sys.executable, "-B", "-c", program),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_smoothed_body_facing_matches_holden_after_z_up_conversion(self) -> None:
+        flat = _Plane()
+        clip, _, _ = _fixture(
+            slope=flat,
+            clip_id="walk1_subject1",
+            terrain_id="flat",
+        )
+        frame = np.arange(clip.frame_count, dtype=np.float64)
+        authored_yaw = 0.75 * np.tanh((frame - 45.0) / 3.0)
+        facing_clip = _with_body_facing(clip, authored_yaw)
+        facing_function = getattr(
+            pfnn_features, "smoothed_body_facing_yaw_world", None
+        )
+        self.assertTrue(
+            callable(facing_function),
+            "features must expose the Holden-parity smoothed body-facing yaw",
+        )
+
+        actual = facing_function(facing_clip)
+        expected = _holden_reference_facing_yaw(facing_clip)
+        np.testing.assert_allclose(actual, expected, atol=1.0e-10, rtol=0.0)
+        self.assertGreater(float(np.max(np.abs(actual - authored_yaw))), 0.1)
+
+        mirrored_body = np.array(facing_clip.body_position_world, copy=True)
+        mirrored_body = mirrored_body[:, BODY_MIRROR_PERMUTATION]
+        mirrored_body[..., 1] *= -1.0
+        mirrored = replace(facing_clip, body_position_world=mirrored_body)
+        mirrored_yaw = facing_function(mirrored)
+        np.testing.assert_allclose(np.cos(mirrored_yaw), np.cos(actual), atol=1e-10)
+        np.testing.assert_allclose(np.sin(mirrored_yaw), -np.sin(actual), atol=1e-10)
+
+    def test_body_facing_not_pelvis_twist_defines_the_feature_frame(self) -> None:
+        flat = _Plane()
+        clip, track, _ = _fixture(
+            slope=flat,
+            clip_id="walk1_subject1",
+            terrain_id="flat",
+        )
+        body_facing = _with_body_facing(
+            clip, np.zeros(clip.frame_count, dtype=np.float64)
+        )
+        pelvis_yaw = 0.4 + np.arange(clip.frame_count, dtype=np.float64) * 0.01
+        pelvis_quaternion = np.stack(
+            (
+                np.cos(pelvis_yaw / 2.0),
+                np.zeros_like(pelvis_yaw),
+                np.zeros_like(pelvis_yaw),
+                np.sin(pelvis_yaw / 2.0),
+            ),
+            axis=1,
+        ).astype(np.float32)
+        twisted = replace(
+            body_facing, root_quaternion_world_wxyz=pelvis_quaternion
+        )
+        sample = next(
+            window
+            for window in build_clip_windows(
+                twisted, track, height_at=flat.height_at
+            )
+            if window.center_frame == 40
+        )
+
+        np.testing.assert_allclose(
+            sample.y[OUTPUT_LAYOUT["root_planar_velocity"]],
+            (0.6, 0.0),
+            atol=2.0e-6,
+        )
+        np.testing.assert_allclose(
+            sample.y[OUTPUT_LAYOUT["root_yaw_velocity"]], (0.0,), atol=1.0e-6
+        )
+        np.testing.assert_allclose(
+            sample.x[INPUT_LAYOUT["trajectory_position"]].reshape(12, 2)[:, 1],
+            0.0,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            sample.x[INPUT_LAYOUT["trajectory_direction"]].reshape(12, 2),
+            np.tile((1.0, 0.0), (12, 1)),
+            atol=1.0e-6,
+        )
+
     def test_exact_shapes_terrain_order_provenance_and_frame_bounds(self) -> None:
         clip, track, slope = _fixture()
         windows = build_clip_windows(clip, track, height_at=slope.height_at)
@@ -260,10 +432,8 @@ class TrainingWindowTest(unittest.TestCase):
 
         input_body = sample.x[INPUT_LAYOUT["previous_body_position"]].reshape(30, 3)
         target_body = sample.y[OUTPUT_LAYOUT["body_position"]].reshape(30, 3)
-        expected_offsets = np.zeros((30, 3), dtype=np.float32)
-        expected_offsets[:, 0] = np.arange(30) * 0.01
-        expected_offsets[:, 1] = np.arange(30) * -0.02
-        expected_offsets[:, 2] = 1.0 + np.arange(30) * 0.005
+        expected_offsets = _body_offsets_local()
+        expected_offsets[:, 2] += 1.0
         np.testing.assert_allclose(input_body, expected_offsets, atol=1e-6)
         np.testing.assert_allclose(target_body, expected_offsets, atol=1e-6)
         np.testing.assert_allclose(
@@ -352,7 +522,9 @@ class TrainingWindowTest(unittest.TestCase):
             ),
             axis=1,
         ).astype(np.float32)
-        turning = replace(clip, root_quaternion_world_wxyz=quaternion)
+        turning = _with_body_facing(
+            replace(clip, root_quaternion_world_wxyz=quaternion), yaw
+        )
         sample = next(
             window
             for window in build_clip_windows(

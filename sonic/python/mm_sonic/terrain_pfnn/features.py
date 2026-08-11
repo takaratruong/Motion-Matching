@@ -44,6 +44,12 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _POLAR_MIRROR = np.array((1.0, -1.0, 1.0), dtype=np.float64)
 _CONTACT_MIRROR = np.array((2, 3, 0, 1), dtype=np.int64)
+_LEFT_HIP_BODY = ISAACLAB_BODY_NAMES.index("left_hip_pitch_link")
+_RIGHT_HIP_BODY = ISAACLAB_BODY_NAMES.index("right_hip_pitch_link")
+_LEFT_SHOULDER_BODY = ISAACLAB_BODY_NAMES.index("left_shoulder_pitch_link")
+_RIGHT_SHOULDER_BODY = ISAACLAB_BODY_NAMES.index("right_shoulder_pitch_link")
+_HOLDEN_SOURCE_FPS = 120.0
+_HOLDEN_FACING_FILTER_SIGMA_FRAMES = 20.0
 
 
 def _mirror_permutation(names: tuple[str, ...]) -> np.ndarray:
@@ -146,13 +152,37 @@ class _RejectWindow(ValueError):
     pass
 
 
-def _yaw_from_wxyz(quaternion: np.ndarray) -> np.ndarray:
-    q = np.asarray(quaternion, dtype=np.float64)
-    w, x, y, z = np.moveaxis(q, -1, 0)
-    return np.arctan2(
-        2.0 * (w * z + x * y),
-        1.0 - 2.0 * (y * y + z * z),
+def smoothed_body_facing_yaw_world(clip: PFNNSourceClip) -> np.ndarray:
+    """Return Holden's hip-plus-shoulder facing yaw in G1's z-up frame."""
+
+    from scipy.ndimage import gaussian_filter1d
+
+    if not isinstance(clip, PFNNSourceClip):
+        raise TypeError("clip must be a PFNNSourceClip")
+    position = np.asarray(clip.body_position_world, dtype=np.float64)
+    across = (
+        position[:, _LEFT_SHOULDER_BODY]
+        - position[:, _RIGHT_SHOULDER_BODY]
+        + position[:, _LEFT_HIP_BODY]
+        - position[:, _RIGHT_HIP_BODY]
     )
+    across_norm = np.linalg.norm(across, axis=1)
+    if np.any(across_norm < 1.0e-8):
+        raise ValueError("clip body facing axis is invalid")
+    across /= across_norm[:, None]
+
+    # The release smooths with sigma=20 on native 120 Hz BVH data. Source
+    # clips are already 30 Hz, so sigma=5 preserves the filter's time width.
+    sigma = _HOLDEN_FACING_FILTER_SIGMA_FRAMES * clip.fps / _HOLDEN_SOURCE_FPS
+    forward = np.cross(across, np.array((0.0, 0.0, 1.0)))
+    forward = gaussian_filter1d(forward, sigma, axis=0, mode="nearest")
+    forward_norm = np.linalg.norm(forward, axis=1)
+    if np.any(forward_norm < 1.0e-8):
+        raise ValueError("clip smoothed body facing axis is invalid")
+    forward /= forward_norm[:, None]
+    yaw = np.ascontiguousarray(np.arctan2(forward[:, 1], forward[:, 0]))
+    yaw.flags.writeable = False
+    return yaw
 
 
 def _wrap_angle(angle: float) -> float:
@@ -545,7 +575,7 @@ def build_clip_windows_with_audit(
         raise TypeError("height_at must be callable")
     _validate_track(phase_track, clip.frame_count)
     _validate_terrain_family(clip, height_at)
-    root_yaw = _yaw_from_wxyz(clip.root_quaternion_world_wxyz)
+    root_yaw = smoothed_body_facing_yaw_world(clip)
     facing_world = np.column_stack((np.cos(root_yaw), np.sin(root_yaw)))
 
     earliest = int(math.ceil(-float(np.min(TRAJECTORY_TIMES_S)) * _FPS))
@@ -656,4 +686,5 @@ __all__ = [
     "build_clip_windows",
     "build_clip_windows_with_audit",
     "mirror_window",
+    "smoothed_body_facing_yaw_world",
 ]
