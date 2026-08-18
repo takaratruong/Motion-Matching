@@ -16,6 +16,7 @@ from mm_sonic.justin_recovery import (
     load_recovery_trace,
     load_reference_bank,
     rank_recovery_candidates,
+    reference_task12,
     select_rewind_queries,
 )
 
@@ -41,6 +42,7 @@ def _write_trace(path: Path, frames: int = 140) -> Path:
     body_lin[:, 0, 0] = 0.5
     body_lin[:, 12, 0] = 0.5
     body_ang = np.zeros_like(body_lin)
+    task12 = np.tile(np.asarray((0.5, 0.0, 0.0), np.float32), (frames, 4))
     np.savez(
         path,
         physics_step=np.arange(frames, dtype=np.int64) * 4,
@@ -57,6 +59,7 @@ def _write_trace(path: Path, frames: int = 140) -> Path:
         right_foot_contact=np.zeros(frames, np.bool_),
         forbidden_nonfoot_contact=np.zeros(frames, np.bool_),
         minimum_contact_distance_m=np.full(frames, -0.001, np.float32),
+        task12=task12,
     )
     return path
 
@@ -75,7 +78,9 @@ def _write_reference(path: Path, frames: int = 160, offset: float = 0.0) -> Path
     body_pos[:, 18] += np.asarray((0.0, 0.12, -0.75), np.float32)
     body_pos[:, 19] += np.asarray((0.0, -0.12, -0.75), np.float32)
     body_quat = np.zeros((frames, 30, 4), np.float32)
-    body_quat[..., 0] = 1.0
+    # The reference travels along world -X while facing world -X, so its
+    # canonical local command is +0.5 m/s forward like the learner trace.
+    body_quat[..., 3] = 1.0
     body_lin = np.zeros((frames, 30, 3), np.float32)
     body_lin[:, 0, 0] = -0.5
     body_lin[:, 18, 0] = 0.0  # inferred left support
@@ -170,6 +175,36 @@ def test_ranker_prefers_matching_pose_history_and_support(tmp_path: Path) -> Non
     assert ranked[0].clip_name == "matching"
     assert ranked[0].support == "left"
     assert ranked[0].frames_remaining >= 50
+    assert ranked[0].command_knot_rmse == pytest.approx(0.0)
+    np.testing.assert_allclose(
+        np.asarray(ranked[0].reference_task12).reshape(4, 3)[:, 0], 0.5
+    )
+
+
+def test_reference_task12_uses_canonical_future_offsets(tmp_path: Path) -> None:
+    clip = load_reference_bank(
+        [_write_reference(tmp_path / f"clip_{index}.npz") for index in range(4)]
+    )[0]
+    task = reference_task12(clip, 30)
+    assert task.shape == (4, 3)
+    np.testing.assert_allclose(task, np.tile((0.5, 0.0, 0.0), (4, 1)), atol=1e-6)
+
+
+def test_ranker_hard_rejects_command_mismatch(tmp_path: Path) -> None:
+    trace_path = _write_trace(tmp_path / "trace.npz")
+    with np.load(trace_path) as source:
+        arrays = {name: source[name] for name in source.files}
+    arrays["task12"][:] = np.tile((0.5, 0.5, 0.8), 4)
+    np.savez(trace_path, **arrays)
+    trace = load_recovery_trace(trace_path)
+    query = select_rewind_queries(
+        trace, first_fall_physics_step=500, rewinds_s=(0.5,)
+    )[0]
+    bank = load_reference_bank(
+        [_write_reference(tmp_path / f"clip_{index}.npz") for index in range(4)]
+    )
+    with pytest.raises(RecoveryContractError, match="no Justin reference candidate"):
+        rank_recovery_candidates(trace, query, bank)
 
 
 def test_proposal_preserves_a_rejected_rewind(tmp_path: Path, monkeypatch) -> None:

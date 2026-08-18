@@ -34,6 +34,11 @@ DEFAULT_TOP_K = 16
 MIN_REMAINING_FRAMES = 50
 FAILURE_PELVIS_HEIGHT_M = 0.55
 FAILURE_SUSTAIN_FRAMES = 10
+TASK12_OFFSETS = np.asarray((6, 12, 18, 24), dtype=np.int64)
+COMMAND_KNOT_RMSE_LIMIT = 0.20
+COMMAND_MEAN_PLANAR_ERROR_LIMIT = 0.20
+COMMAND_MEAN_YAW_RATE_ERROR_LIMIT = 0.15
+COMMAND_COST_SCALE = np.asarray((0.20, 0.20, 0.30), dtype=np.float64)
 
 # The trace drops MuJoCo's world body via ``data.xpos[1:31]``.  These are
 # therefore robot-array indices, one below the absolute MuJoCo body ids used
@@ -65,6 +70,7 @@ REQUIRED_TRACE_FIELDS = {
     "right_foot_contact": (),
     "forbidden_nonfoot_contact": (),
     "minimum_contact_distance_m": (),
+    "task12": (12,),
 }
 
 REFERENCE_FIELDS = {
@@ -124,6 +130,11 @@ class RecoveryCandidate:
     velocity_cost: float
     foot_cost: float
     stage_cost: float
+    command_cost: float
+    command_knot_rmse: float
+    command_mean_planar_error: float
+    command_mean_yaw_rate_error: float
+    reference_task12: tuple[float, ...]
     support: str
     stage: int
     frames_remaining: int
@@ -139,6 +150,11 @@ class RecoveryCandidate:
             "velocity_cost": self.velocity_cost,
             "foot_cost": self.foot_cost,
             "stage_cost": self.stage_cost,
+            "command_cost": self.command_cost,
+            "command_knot_rmse": self.command_knot_rmse,
+            "command_mean_planar_error": self.command_mean_planar_error,
+            "command_mean_yaw_rate_error": self.command_mean_yaw_rate_error,
+            "reference_task12": list(self.reference_task12),
             "support": self.support,
             "stage": self.stage,
             "frames_remaining": self.frames_remaining,
@@ -453,6 +469,33 @@ def _reference_history(clip: ReferenceClip, frame: int):
     )
 
 
+def reference_task12(clip: ReferenceClip, frame: int) -> np.ndarray:
+    """Infer the canonical four-knot Task12 from a clean reference root."""
+    frame = int(frame)
+    if frame < 0 or frame >= clip.frame_count:
+        raise RecoveryContractError("reference command frame is out of range")
+    a = clip.arrays
+    root_quat = np.asarray(
+        a["body_quat_w"][:, REFERENCE_ROOT_BODY], dtype=np.float64
+    )
+    root_velocity = np.asarray(
+        a["body_lin_vel_w"][:, REFERENCE_ROOT_BODY], dtype=np.float64
+    )
+    root_angular_velocity = np.asarray(
+        a["body_ang_vel_w"][:, REFERENCE_ROOT_BODY], dtype=np.float64
+    )
+    yaw = _yaw_from_wxyz(root_quat)
+    command3 = np.concatenate(
+        (
+            _heading_local(root_velocity, yaw)[:, :2],
+            root_angular_velocity[:, 2:3],
+        ),
+        axis=1,
+    )
+    indices = np.minimum(frame + TASK12_OFFSETS, clip.frame_count - 1)
+    return np.ascontiguousarray(command3[indices], dtype=np.float32)
+
+
 def rank_recovery_candidates(
     trace: RecoveryTrace,
     query: RecoveryQuery,
@@ -464,6 +507,9 @@ def rank_recovery_candidates(
     if top_k <= 0:
         raise RecoveryContractError("top_k must be positive")
     query_pose, query_velocity, query_feet = _query_history(trace, query)
+    query_task12 = np.asarray(
+        trace.arrays["task12"][query.trace_index], dtype=np.float64
+    ).reshape(4, 3)
     weights = np.linspace(0.25, 1.0, HISTORY_FRAMES, dtype=np.float64)[:, None]
     i = query.trace_index
     a = trace.arrays
@@ -489,6 +535,10 @@ def rank_recovery_candidates(
         progress = S13_REFERENCE_FRONT_XY[0] - root_position[:, 0]
         stages = _terrain_stage(progress)
         support = _reference_support(clip)
+        clip_task12 = {
+            frame: reference_task12(clip, frame).astype(np.float64)
+            for frame in range(HISTORY_FRAMES - 1, clip.frame_count - MIN_REMAINING_FRAMES)
+        }
         start = HISTORY_FRAMES - 1
         stop = clip.frame_count - MIN_REMAINING_FRAMES
         for frame in range(start, stop):
@@ -503,6 +553,26 @@ def rank_recovery_candidates(
             future = min(frame + MIN_REMAINING_FRAMES, clip.frame_count - 1)
             if root_z[future] < root_z[frame] - 0.06:
                 continue
+            ref_task12 = clip_task12[frame]
+            command_delta = query_task12 - ref_task12
+            command_knot_rmse = float(np.sqrt(np.mean(command_delta**2)))
+            query_command_mean = query_task12.mean(axis=0)
+            reference_command_mean = ref_task12.mean(axis=0)
+            command_mean_planar_error = float(
+                np.linalg.norm(query_command_mean[:2] - reference_command_mean[:2])
+            )
+            command_mean_yaw_rate_error = float(
+                abs(query_command_mean[2] - reference_command_mean[2])
+            )
+            if (
+                command_knot_rmse > COMMAND_KNOT_RMSE_LIMIT
+                or command_mean_planar_error > COMMAND_MEAN_PLANAR_ERROR_LIMIT
+                or command_mean_yaw_rate_error > COMMAND_MEAN_YAW_RATE_ERROR_LIMIT
+            ):
+                continue
+            command_cost = float(
+                np.mean((command_delta / COMMAND_COST_SCALE[None, :]) ** 2)
+            )
             ref_pose, ref_velocity, ref_feet = _reference_history(clip, frame)
             pose_cost = float(np.sum(weights * (query_pose - ref_pose) ** 2) / np.sum(weights))
             velocity_cost = float(
@@ -514,7 +584,13 @@ def rank_recovery_candidates(
             stage_cost = float(
                 ((float(progress[frame]) - query_progress) / S13_TREAD_M) ** 2
             )
-            total = pose_cost + 0.45 * velocity_cost + 0.35 * foot_cost + 0.20 * stage_cost
+            total = (
+                pose_cost
+                + 0.45 * velocity_cost
+                + 0.35 * foot_cost
+                + 0.20 * stage_cost
+                + command_cost
+            )
             candidates.append(
                 RecoveryCandidate(
                     clip_name=clip.name,
@@ -526,6 +602,11 @@ def rank_recovery_candidates(
                     velocity_cost=velocity_cost,
                     foot_cost=foot_cost,
                     stage_cost=stage_cost,
+                    command_cost=command_cost,
+                    command_knot_rmse=command_knot_rmse,
+                    command_mean_planar_error=command_mean_planar_error,
+                    command_mean_yaw_rate_error=command_mean_yaw_rate_error,
+                    reference_task12=tuple(float(value) for value in ref_task12.reshape(-1)),
                     support=str(support[frame]),
                     stage=int(stages[frame]),
                     frames_remaining=clip.frame_count - frame - 1,
@@ -562,6 +643,9 @@ def build_recovery_proposal(
             "physics_step": query.physics_step,
             "history_start": query.history_start,
             "learner_state": {name: value.tolist() for name, value in state.items()},
+            "learner_task12": np.asarray(
+                trace.arrays["task12"][query.trace_index], dtype=np.float32
+            ).tolist(),
         }
         try:
             candidates = rank_recovery_candidates(trace, query, clips, top_k=top_k)
@@ -576,7 +660,7 @@ def build_recovery_proposal(
     if not any(row["candidates"] for row in query_rows):
         raise RecoveryContractError("no Justin reference candidate survived any rewind")
     return {
-        "schema": "justin-s13-tracker-recovery-proposal/v1",
+        "schema": "justin-s13-tracker-recovery-proposal/v2",
         "trace_path": str(trace.path),
         "trace_sha256": trace.sha256,
         "first_fall_physics_step": (
@@ -593,6 +677,15 @@ def build_recovery_proposal(
         ),
         "control_hz": CONTROL_HZ,
         "history_frames": HISTORY_FRAMES,
+        "command_matching": {
+            "source": "exact learner Task12 versus clean-reference inferred Task12",
+            "task12_offsets": TASK12_OFFSETS.tolist(),
+            "command3": "[local_vx_m_s, local_vy_m_s, yaw_rate_rad_s]",
+            "knot_rmse_limit": COMMAND_KNOT_RMSE_LIMIT,
+            "mean_planar_error_limit": COMMAND_MEAN_PLANAR_ERROR_LIMIT,
+            "mean_yaw_rate_error_limit": COMMAND_MEAN_YAW_RATE_ERROR_LIMIT,
+            "hard_filter": True,
+        },
         "matching_only": True,
         "fine_tuning_performed": False,
         "scene_transform": {

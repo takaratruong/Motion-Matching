@@ -165,7 +165,10 @@ def _sha256(path: Path) -> str:
 def select_proposal_candidate(
     proposal: Mapping[str, object], *, query_index: int, candidate_index: int
 ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    if proposal.get("schema") != "justin-s13-tracker-recovery-proposal/v1":
+    if proposal.get("schema") not in {
+        "justin-s13-tracker-recovery-proposal/v1",
+        "justin-s13-tracker-recovery-proposal/v2",
+    }:
         raise TrackerRecoveryError("unsupported recovery proposal schema")
     try:
         query = proposal["queries"][int(query_index)]  # type: ignore[index]

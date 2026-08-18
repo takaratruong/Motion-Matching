@@ -63,6 +63,15 @@ def _proposal() -> dict:
     }
 
 
+def test_select_proposal_candidate_accepts_command_matched_schema() -> None:
+    proposal = _proposal()
+    proposal["schema"] = "justin-s13-tracker-recovery-proposal/v2"
+    _, candidate = select_proposal_candidate(
+        proposal, query_index=0, candidate_index=0
+    )
+    assert candidate["frame"] == 10
+
+
 def test_select_proposal_candidate_is_strict() -> None:
     query, candidate = select_proposal_candidate(
         _proposal(), query_index=0, candidate_index=0
