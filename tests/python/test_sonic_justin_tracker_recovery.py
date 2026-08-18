@@ -12,6 +12,7 @@ from mm_sonic.justin_tracker_recovery import (
     _slerp_wxyz,
     evaluate_tracker_attempt,
     select_proposal_candidate,
+    validate_exact_learner_history,
     validate_reference_blend,
 )
 
@@ -70,6 +71,52 @@ def test_select_proposal_candidate_accepts_command_matched_schema() -> None:
         proposal, query_index=0, candidate_index=0
     )
     assert candidate["frame"] == 10
+
+
+def _exact_history_query() -> dict:
+    state = {
+        "root_pose_wxyz": [0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0],
+        "root_velocity_world": [0.0] * 6,
+        "joint_pos_isaac": [0.0] * 29,
+        "joint_vel_isaac": [0.0] * 29,
+    }
+    return {
+        "trace_index": 19,
+        "learner_state": state,
+        "learner_tracker_history": [
+            {
+                "trace_index": index,
+                "physics_step": index * 4,
+                "state": state,
+                "last_action_isaac_normalized": [index / 100.0] * 29,
+            }
+            for index in range(10, 20)
+        ],
+    }
+
+
+def test_exact_history_maps_learner_chronology_to_reference_clock() -> None:
+    history = validate_exact_learner_history(
+        _exact_history_query(), {"frame": 100}
+    )
+    assert [row["trace_index"] for row in history] == list(range(10, 20))
+    assert [row["reference_frame"] for row in history] == list(range(91, 101))
+    assert history[-1]["last_action_isaac_normalized"].shape == (29,)
+
+
+def test_exact_history_rejects_noncontiguous_or_state_drift() -> None:
+    query = _exact_history_query()
+    query["learner_tracker_history"][3]["trace_index"] = 99
+    with pytest.raises(TrackerRecoveryError, match="not contiguous"):
+        validate_exact_learner_history(query, {"frame": 100})
+
+    query = _exact_history_query()
+    query["learner_tracker_history"][-1]["state"] = dict(
+        query["learner_tracker_history"][-1]["state"]
+    )
+    query["learner_tracker_history"][-1]["state"]["joint_pos_isaac"] = [0.1] * 29
+    with pytest.raises(TrackerRecoveryError, match="differs from history tail"):
+        validate_exact_learner_history(query, {"frame": 100})
 
 
 def test_select_proposal_candidate_is_strict() -> None:

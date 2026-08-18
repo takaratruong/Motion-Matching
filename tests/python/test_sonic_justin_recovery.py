@@ -9,9 +9,11 @@ import pytest
 import mm_sonic.justin_recovery as justin_recovery
 from mm_sonic.justin_recovery import (
     HISTORY_FRAMES,
+    TRACKER_HISTORY_FRAMES,
     RecoveryContractError,
     build_recovery_proposal,
     learner_state_in_reference_frame,
+    learner_tracker_history_in_reference_frame,
     learner_xy_to_reference,
     load_recovery_trace,
     load_reference_bank,
@@ -51,6 +53,9 @@ def _write_trace(path: Path, frames: int = 140) -> Path:
         qvel_mujoco=qvel,
         joint_pos_isaac=joint_pos,
         joint_vel_isaac=joint_vel,
+        action_isaac_normalized=np.tile(
+            np.linspace(-1.0, 1.0, 29, dtype=np.float32), (frames, 1)
+        ),
         body_pos_mujoco=body_pos,
         body_quat_wxyz_mujoco=body_quat,
         body_lin_vel_world_mujoco=body_lin,
@@ -153,6 +158,28 @@ def test_scene_transform_preserves_learner_offset(tmp_path: Path) -> None:
     assert state["root_velocity_world"][0] == pytest.approx(-0.5)
 
 
+def test_tracker_history_is_exact_chronological_learner_history(
+    tmp_path: Path,
+) -> None:
+    trace = load_recovery_trace(_write_trace(tmp_path / "trace.npz"))
+    query = select_rewind_queries(
+        trace, first_fall_physics_step=500, rewinds_s=(0.5,)
+    )[0]
+    history = learner_tracker_history_in_reference_frame(trace, query)
+    assert len(history) == TRACKER_HISTORY_FRAMES
+    assert [row["trace_index"] for row in history] == list(
+        range(query.trace_index - TRACKER_HISTORY_FRAMES + 1, query.trace_index + 1)
+    )
+    assert history[-1]["state"] == {
+        name: value.tolist()
+        for name, value in learner_state_in_reference_frame(trace, query).items()
+    }
+    np.testing.assert_allclose(
+        history[-1]["last_action_isaac_normalized"],
+        trace.arrays["action_isaac_normalized"][query.trace_index],
+    )
+
+
 def test_bank_size_is_deliberately_small(tmp_path: Path) -> None:
     paths = [_write_reference(tmp_path / f"clip_{i}.npz") for i in range(3)]
     with pytest.raises(RecoveryContractError, match="4..8"):
@@ -226,6 +253,8 @@ def test_proposal_preserves_a_rejected_rewind(tmp_path: Path, monkeypatch) -> No
         rewinds_s=(0.25, 0.5),
     )
     assert proposal["queries"][0]["candidates"]
+    assert proposal["schema"] == "justin-s13-tracker-recovery-proposal/v3"
+    assert len(proposal["queries"][0]["learner_tracker_history"]) == 10
     assert proposal["queries"][1]["candidates"] == []
     assert "deliberate hard-filter rejection" in proposal["queries"][1]["matching_error"]
 

@@ -21,6 +21,8 @@ from typing import Mapping
 
 import numpy as np
 
+from .justin_recovery import TRACKER_HISTORY_FRAMES
+
 
 TRACKER_SCREEN_STEPS = 25
 TRACKER_MPJPE_LIMIT_MM = 300.0
@@ -168,6 +170,7 @@ def select_proposal_candidate(
     if proposal.get("schema") not in {
         "justin-s13-tracker-recovery-proposal/v1",
         "justin-s13-tracker-recovery-proposal/v2",
+        "justin-s13-tracker-recovery-proposal/v3",
     }:
         raise TrackerRecoveryError("unsupported recovery proposal schema")
     try:
@@ -299,6 +302,74 @@ def validate_reference_blend(value: float) -> float:
     return blend
 
 
+_LEARNER_STATE_SHAPES = {
+    "root_pose_wxyz": (7,),
+    "root_velocity_world": (6,),
+    "joint_pos_isaac": (29,),
+    "joint_vel_isaac": (29,),
+}
+
+
+def validate_exact_learner_history(query, candidate):
+    """Validate and materialize the chronological v3 tracker handoff history."""
+
+    rows = query.get("learner_tracker_history")
+    if not isinstance(rows, list) or len(rows) != TRACKER_HISTORY_FRAMES:
+        raise TrackerRecoveryError(
+            f"exact learner handoff needs {TRACKER_HISTORY_FRAMES} history frames"
+        )
+    query_index = int(query["trace_index"])
+    expected_indices = list(
+        range(query_index - TRACKER_HISTORY_FRAMES + 1, query_index + 1)
+    )
+    materialized = []
+    for expected_index, row in zip(expected_indices, rows, strict=True):
+        if not isinstance(row, Mapping) or int(row.get("trace_index", -1)) != expected_index:
+            raise TrackerRecoveryError("learner tracker history is not contiguous")
+        state_json = row.get("state")
+        if not isinstance(state_json, Mapping) or set(state_json) != set(
+            _LEARNER_STATE_SHAPES
+        ):
+            raise TrackerRecoveryError("learner tracker history state schema drifted")
+        state = {}
+        for name, shape in _LEARNER_STATE_SHAPES.items():
+            value = np.asarray(state_json[name], dtype=np.float32)
+            if value.shape != shape or not np.isfinite(value).all():
+                raise TrackerRecoveryError(
+                    f"learner tracker history {name} has invalid shape or values"
+                )
+            state[name] = value
+        action = np.asarray(
+            row.get("last_action_isaac_normalized"), dtype=np.float32
+        )
+        if action.shape != (29,) or not np.isfinite(action).all():
+            raise TrackerRecoveryError("learner tracker history action is invalid")
+        lag = query_index - expected_index
+        reference_frame = int(candidate["frame"]) - lag
+        if reference_frame < 0:
+            raise TrackerRecoveryError("matched reference does not cover tracker history")
+        materialized.append(
+            {
+                "trace_index": expected_index,
+                "reference_frame": reference_frame,
+                "state": state,
+                "last_action_isaac_normalized": action,
+            }
+        )
+    current = query.get("learner_state")
+    if not isinstance(current, Mapping):
+        raise TrackerRecoveryError("proposal has no current learner state")
+    for name in _LEARNER_STATE_SHAPES:
+        if not np.allclose(
+            materialized[-1]["state"][name],
+            np.asarray(current[name], dtype=np.float32),
+            atol=1.0e-6,
+            rtol=0.0,
+        ):
+            raise TrackerRecoveryError("current learner state differs from history tail")
+    return tuple(materialized)
+
+
 def _slerp_wxyz(start, end, amount: float):
     """Shortest-arc spherical interpolation for two scalar-first quaternions."""
     import torch
@@ -320,6 +391,154 @@ def _slerp_wxyz(start, end, amount: float):
         + torch.sin(float(amount) * theta) / sin_theta * end
     )
     return result / result.norm().clamp_min(1.0e-8)
+
+
+def _write_tracker_state(
+    env,
+    robot,
+    motion_cmd,
+    *,
+    state,
+    reference_frame: int,
+    last_action,
+    previous_action,
+    device: str,
+):
+    """Repose one saved learner row without taking a physics step."""
+
+    import torch
+
+    motion_cmd.motion_ids.fill_(0)
+    motion_cmd.motion_start_time_steps.fill_(int(reference_frame))
+    motion_cmd.time_steps.zero_()
+    root_pose = torch.as_tensor(
+        state["root_pose_wxyz"], device=device, dtype=torch.float32
+    )
+    root_velocity = torch.as_tensor(
+        state["root_velocity_world"], device=device, dtype=torch.float32
+    )
+    joint_pos = torch.as_tensor(
+        state["joint_pos_isaac"], device=device, dtype=torch.float32
+    )
+    joint_vel = torch.as_tensor(
+        state["joint_vel_isaac"], device=device, dtype=torch.float32
+    )
+    robot.write_root_pose_to_sim(root_pose.unsqueeze(0))
+    robot.write_root_velocity_to_sim(root_velocity.unsqueeze(0))
+    robot.write_joint_state_to_sim(joint_pos.unsqueeze(0), joint_vel.unsqueeze(0))
+
+    action_manager = env.env.action_manager
+    action = torch.as_tensor(last_action, device=device, dtype=torch.float32).unsqueeze(0)
+    previous = torch.as_tensor(
+        previous_action, device=device, dtype=torch.float32
+    ).unsqueeze(0)
+    if action_manager.action.shape != action.shape:
+        raise TrackerRecoveryError("tracker and learner action dimensions differ")
+    action_manager._action.copy_(action)
+    action_manager._prev_action.copy_(previous)
+    env.env.scene.write_data_to_sim()
+    env.env.sim.forward()
+    env.env.scene.update(dt=env.env.step_dt)
+    return root_pose, root_velocity, joint_pos, joint_vel
+
+
+def _inject_exact_learner_handoff(
+    env, robot, motion_cmd, query, candidate, device: str
+):
+    """Install exact learner state and the actor's ten-frame input history."""
+
+    import torch
+
+    history = validate_exact_learner_history(query, candidate)
+    observation_manager = env.env.observation_manager
+    buffers_by_group = observation_manager._group_obs_term_history_buffer
+    for group_buffers in buffers_by_group.values():
+        for buffer in group_buffers.values():
+            buffer.reset()
+
+    raw = None
+    final_tensors = None
+    for index, row in enumerate(history):
+        previous_action = (
+            history[index - 1]["last_action_isaac_normalized"]
+            if index > 0
+            else row["last_action_isaac_normalized"]
+        )
+        final_tensors = _write_tracker_state(
+            env,
+            robot,
+            motion_cmd,
+            state=row["state"],
+            reference_frame=row["reference_frame"],
+            last_action=row["last_action_isaac_normalized"],
+            previous_action=previous_action,
+            device=device,
+        )
+        raw = observation_manager.compute(update_history=True)
+    assert raw is not None and final_tensors is not None
+
+    policy_buffers = buffers_by_group.get("policy", {})
+    term_lengths = {
+        name: int(buffer.current_length[0].item())
+        for name, buffer in policy_buffers.items()
+    }
+    incomplete = {
+        name: length
+        for name, length in term_lengths.items()
+        if length != TRACKER_HISTORY_FRAMES
+    }
+    if incomplete:
+        raise TrackerRecoveryError(f"tracker observation history is incomplete: {incomplete}")
+    if "actions" not in policy_buffers:
+        raise TrackerRecoveryError("tracker policy has no action history buffer")
+    expected_actions = torch.as_tensor(
+        np.stack(
+            [row["last_action_isaac_normalized"] for row in history], axis=0
+        ),
+        device=device,
+        dtype=torch.float32,
+    )
+    actual_actions = policy_buffers["actions"].buffer[0]
+    action_history_max_abs_error = float(
+        torch.max(torch.abs(actual_actions - expected_actions)).item()
+    )
+    if action_history_max_abs_error > 1.0e-6:
+        raise TrackerRecoveryError("tracker action history differs from learner trace")
+
+    root_pose, _root_velocity, joint_pos, _joint_vel = final_tensors
+    reference_root_pose = torch.cat(
+        (motion_cmd.body_pos_w[0, 0], motion_cmd.body_quat_w[0, 0])
+    )
+    reference_joint_pos = motion_cmd.joint_pos[0]
+    injected_body_error = (
+        (motion_cmd.body_pos_w - motion_cmd.robot_body_pos_w).norm(dim=-1) * 1000.0
+    )
+    quat_dot = torch.dot(root_pose[3:], reference_root_pose[3:]).abs().clamp(0.0, 1.0)
+    diagnostics = {
+        "reference_blend": 0.0,
+        "learner_weight": 1.0,
+        "injected_mpjpe_mm": float(injected_body_error.mean(dim=-1)[0].item()),
+        "injected_root_position_error_m": float(
+            (root_pose[:3] - reference_root_pose[:3]).norm().item()
+        ),
+        "injected_root_rotation_error_rad": float((2.0 * torch.acos(quat_dot)).item()),
+        "injected_joint_position_rmse_rad": float(
+            torch.sqrt(torch.mean((joint_pos - reference_joint_pos) ** 2)).item()
+        ),
+    }
+    history_receipt = {
+        "frames": len(history),
+        "trace_indices": [row["trace_index"] for row in history],
+        "reference_frames": [row["reference_frame"] for row in history],
+        "policy_term_lengths": term_lengths,
+        "action_history_max_abs_error": action_history_max_abs_error,
+        "source": "exact learner trace",
+    }
+    return (
+        env.process_raw_obs(raw, flatten_dict_obs=True),
+        diagnostics,
+        history_receipt,
+    )
 
 
 def _inject_recovery_state(
@@ -454,15 +673,31 @@ def run(args: argparse.Namespace) -> Path:
     disabled_terminations = _disable_builtin_failure_terminations(env)
     motion_cmd = env.env.command_manager.get_term("motion")
     _place_identity_object(env, motion_lib, args.device)
-    obs, injection = _inject_recovery_state(
-        env,
-        robot,
-        motion_cmd,
-        query,
-        candidate,
-        args.device,
-        reference_blend=args.reference_blend,
-    )
+    if args.exact_learner_handoff:
+        if proposal.get("schema") != "justin-s13-tracker-recovery-proposal/v3":
+            raise TrackerRecoveryError(
+                "exact learner handoff requires a v3 proposal with learner history"
+            )
+        if args.reference_blend != 0.0:
+            raise TrackerRecoveryError(
+                "exact learner handoff prohibits reference-state blending"
+            )
+        obs, injection, tracker_history = _inject_exact_learner_handoff(
+            env, robot, motion_cmd, query, candidate, args.device
+        )
+        handoff_mode = "exact_learner_state_and_history"
+    else:
+        obs, injection = _inject_recovery_state(
+            env,
+            robot,
+            motion_cmd,
+            query,
+            candidate,
+            args.device,
+            reference_blend=args.reference_blend,
+        )
+        tracker_history = None
+        handoff_mode = "legacy_instantaneous_state"
     obs = {name: value.to(args.device) for name, value in obs.items()}
 
     frame = int(candidate["frame"])
@@ -524,7 +759,7 @@ def run(args: argparse.Namespace) -> Path:
         fps=np.asarray([50], dtype=np.int64),
     )
     receipt = {
-        "schema": "justin-s13-tracker-recovery-attempt/v2",
+        "schema": "justin-s13-tracker-recovery-attempt/v3",
         "proposal": str(proposal_path),
         "proposal_sha256": _sha256(proposal_path),
         "query_index": int(args.query_index),
@@ -547,8 +782,12 @@ def run(args: argparse.Namespace) -> Path:
         ).strip(),
         "checkpoint_dir": str(checkpoint_dir),
         "checkpoint_sha256": _sha256(checkpoint_dir / "last.pt"),
-        "exact_learner_state_injection": args.reference_blend == 0.0,
+        "handoff_mode": handoff_mode,
+        "exact_learner_state_injection": (
+            args.exact_learner_handoff and args.reference_blend == 0.0
+        ),
         "state_injection": injection,
+        "tracker_history": tracker_history,
         "blend_steps": 0,
         "disabled_training_terminations": list(disabled_terminations),
         "urdf_importer_compatibility": {
@@ -589,6 +828,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=validate_reference_blend,
         default=0.0,
         help="fraction of the matched tracker reference state injected at handoff",
+    )
+    parser.add_argument(
+        "--exact-learner-handoff",
+        action="store_true",
+        help=(
+            "use 100% learner state and reconstruct the production actor's "
+            "ten-frame learner observation/action history"
+        ),
     )
     parser.add_argument("--kit-cache", required=True)
     return parser.parse_args(argv)

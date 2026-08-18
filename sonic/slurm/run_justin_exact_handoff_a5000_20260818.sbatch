@@ -1,6 +1,7 @@
 #!/bin/bash
-# One task per seed.  TASK_FILE is a tab-separated, shared-NFS file with:
-# proposal.json <tab> query_index <tab> candidate_index <tab> output_dir <tab> seed <tab> reference_blend <tab> exact_learner_handoff
+# TASK_FILE columns:
+# proposal, query_index, candidate_index, output_dir, seed, reference_blend,
+# exact_learner_handoff.  Exact handoffs require the final two values to be 0,1.
 #SBATCH --account=move
 #SBATCH --partition=move
 #SBATCH --nodes=1
@@ -8,10 +9,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=01:00:00
-#SBATCH --gres=gpu:l40s:1
-#SBATCH --constraint=ada
-#SBATCH --array=0-2%1
-#SBATCH --job-name=justin-rec-track
+#SBATCH --gres=gpu:a5000:1
+#SBATCH --array=0-2%3
+#SBATCH --job-name=justin-exact
 #SBATCH --output=/move/u/bodow/outputs/justin_recovery_test/dense_epoch2_state41/slurm_logs/%x-%A_%a.out
 #SBATCH --error=/move/u/bodow/outputs/justin_recovery_test/dense_epoch2_state41/slurm_logs/%x-%A_%a.err
 
@@ -24,9 +24,8 @@ PYTHON=/move/u/justingu/miniconda3/envs/env_isaaclab/bin/python
 [[ -s "$TASK_FILE" && -x "$PYTHON" ]]
 line=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$TASK_FILE")
 IFS=$'\t' read -r proposal query_index candidate_index output seed reference_blend exact_learner_handoff <<< "$line"
-exact_learner_handoff=${exact_learner_handoff:-0}
-[[ -n "$proposal" && -n "$query_index" && -n "$candidate_index" && -n "$output" && -n "$seed" && -n "$reference_blend" ]]
-[[ "$exact_learner_handoff" == 0 || "$exact_learner_handoff" == 1 ]]
+[[ -n "$proposal" && -n "$query_index" && -n "$candidate_index" && -n "$output" && -n "$seed" ]]
+[[ "$reference_blend" == 0 && "$exact_learner_handoff" == 1 ]]
 [[ -s "$proposal" ]]
 if [[ -e "$output" ]]; then
   echo "ownership collision: $output already exists" >&2
@@ -37,14 +36,9 @@ export OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y PYTHONUNBUFFERED=1 HYDRA_FULL_ERRO
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$REPO/sonic/python:$TRACKER:$TRACKER/GRAIL/imports/SONIC${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-kit_cache=/tmp/bodow-justin-recovery-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}
+kit_cache=/tmp/bodow-justin-exact-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}
 mkdir -p "$kit_cache"
 cd "$REPO"
-
-handoff_args=()
-if [[ "$exact_learner_handoff" == 1 ]]; then
-  handoff_args+=(--exact-learner-handoff)
-fi
 
 exec "$PYTHON" -u -m mm_sonic.justin_tracker_recovery \
   --proposal "$proposal" \
@@ -54,6 +48,5 @@ exec "$PYTHON" -u -m mm_sonic.justin_tracker_recovery \
   --tracker-repo "$TRACKER" \
   --checkpoint-dir "$TRACKER/data/sonic_checkpoints/terrain_release" \
   --device cuda:0 --seed "$seed" --episode-length-s 12 \
-  --reference-blend "$reference_blend" \
-  "${handoff_args[@]}" \
+  --reference-blend 0 --exact-learner-handoff \
   --kit-cache "$kit_cache"

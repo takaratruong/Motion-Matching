@@ -29,6 +29,7 @@ import numpy as np
 
 CONTROL_HZ = 50
 HISTORY_FRAMES = 20
+TRACKER_HISTORY_FRAMES = 10
 DEFAULT_REWINDS_S = (0.25, 0.5, 0.75, 1.0)
 DEFAULT_TOP_K = 16
 MIN_REMAINING_FRAMES = 50
@@ -62,6 +63,7 @@ REQUIRED_TRACE_FIELDS = {
     "qvel_mujoco": (35,),
     "joint_pos_isaac": (29,),
     "joint_vel_isaac": (29,),
+    "action_isaac_normalized": (29,),
     "body_pos_mujoco": (30, 3),
     "body_quat_wxyz_mujoco": (30, 4),
     "body_lin_vel_world_mujoco": (30, 3),
@@ -367,6 +369,43 @@ def learner_state_in_reference_frame(
     }
 
 
+def learner_tracker_history_in_reference_frame(
+    trace: RecoveryTrace, query: RecoveryQuery
+) -> list[dict[str, object]]:
+    """Return the exact chronological learner inputs needed by the tracker.
+
+    The production actor consumes ten-frame histories of proprioception and
+    normalized actions.  Each state is changed only by the same fixed scene
+    transform used for the handoff state; no reference pose is mixed in.
+    """
+
+    start = query.trace_index - TRACKER_HISTORY_FRAMES + 1
+    if start < query.history_start or start < 0:
+        raise RecoveryContractError("tracker history is not covered by the query")
+    rows: list[dict[str, object]] = []
+    for trace_index in range(start, query.trace_index + 1):
+        history_query = RecoveryQuery(
+            rewind_s=query.rewind_s,
+            trace_index=trace_index,
+            physics_step=int(trace.arrays["physics_step"][trace_index]),
+            history_start=max(0, trace_index - HISTORY_FRAMES + 1),
+        )
+        state = learner_state_in_reference_frame(trace, history_query)
+        action = np.asarray(
+            trace.arrays["action_isaac_normalized"][trace_index],
+            dtype=np.float32,
+        )
+        rows.append(
+            {
+                "trace_index": trace_index,
+                "physics_step": history_query.physics_step,
+                "state": {name: value.tolist() for name, value in state.items()},
+                "last_action_isaac_normalized": action.tolist(),
+            }
+        )
+    return rows
+
+
 def _heading_local(vector: np.ndarray, yaw: np.ndarray) -> np.ndarray:
     result = np.asarray(vector, dtype=np.float64).copy()
     result[..., :2] = _rotate_xy(result[..., :2], -yaw)
@@ -643,6 +682,9 @@ def build_recovery_proposal(
             "physics_step": query.physics_step,
             "history_start": query.history_start,
             "learner_state": {name: value.tolist() for name, value in state.items()},
+            "learner_tracker_history": learner_tracker_history_in_reference_frame(
+                trace, query
+            ),
             "learner_task12": np.asarray(
                 trace.arrays["task12"][query.trace_index], dtype=np.float32
             ).tolist(),
@@ -660,7 +702,7 @@ def build_recovery_proposal(
     if not any(row["candidates"] for row in query_rows):
         raise RecoveryContractError("no Justin reference candidate survived any rewind")
     return {
-        "schema": "justin-s13-tracker-recovery-proposal/v2",
+        "schema": "justin-s13-tracker-recovery-proposal/v3",
         "trace_path": str(trace.path),
         "trace_sha256": trace.sha256,
         "first_fall_physics_step": (
@@ -677,6 +719,12 @@ def build_recovery_proposal(
         ),
         "control_hz": CONTROL_HZ,
         "history_frames": HISTORY_FRAMES,
+        "tracker_history": {
+            "frames": TRACKER_HISTORY_FRAMES,
+            "source": "exact learner state and normalized action trace",
+            "chronology": "oldest_to_current",
+            "reference_clock": "matched frame minus learner-frame lag",
+        },
         "command_matching": {
             "source": "exact learner Task12 versus clean-reference inferred Task12",
             "task12_offsets": TASK12_OFFSETS.tolist(),
