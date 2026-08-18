@@ -289,24 +289,95 @@ def _place_identity_object(env, motion_lib, device: str) -> None:
             buffer[...] = value.view(*([1] * (buffer.ndim - 1)), value.shape[0]).to(buffer.dtype)
 
 
-def _inject_learner_state(env, robot, motion_cmd, query, candidate, device: str) -> None:
+def validate_reference_blend(value: float) -> float:
+    blend = float(value)
+    if not np.isfinite(blend) or not 0.0 <= blend <= 1.0:
+        raise TrackerRecoveryError("reference blend must be finite and in [0, 1]")
+    return blend
+
+
+def _slerp_wxyz(start, end, amount: float):
+    """Shortest-arc spherical interpolation for two scalar-first quaternions."""
     import torch
 
+    start = start / start.norm().clamp_min(1.0e-8)
+    end = end / end.norm().clamp_min(1.0e-8)
+    dot = torch.dot(start, end)
+    if bool((dot < 0.0).item()):
+        end = -end
+        dot = -dot
+    dot = dot.clamp(-1.0, 1.0)
+    if bool((dot > 0.9995).item()):
+        result = start + float(amount) * (end - start)
+        return result / result.norm().clamp_min(1.0e-8)
+    theta = torch.acos(dot)
+    sin_theta = torch.sin(theta)
+    result = (
+        torch.sin((1.0 - float(amount)) * theta) / sin_theta * start
+        + torch.sin(float(amount) * theta) / sin_theta * end
+    )
+    return result / result.norm().clamp_min(1.0e-8)
+
+
+def _inject_recovery_state(
+    env,
+    robot,
+    motion_cmd,
+    query,
+    candidate,
+    device: str,
+    *,
+    reference_blend: float,
+):
+    import torch
+
+    reference_blend = validate_reference_blend(reference_blend)
     state = query["learner_state"]
-    root_pose = torch.as_tensor(state["root_pose_wxyz"], device=device, dtype=torch.float32)
-    root_velocity = torch.as_tensor(
+    learner_root_pose = torch.as_tensor(
+        state["root_pose_wxyz"], device=device, dtype=torch.float32
+    )
+    learner_root_velocity = torch.as_tensor(
         state["root_velocity_world"], device=device, dtype=torch.float32
     )
-    joint_pos = torch.as_tensor(state["joint_pos_isaac"], device=device, dtype=torch.float32)
-    joint_vel = torch.as_tensor(state["joint_vel_isaac"], device=device, dtype=torch.float32)
-    if tuple(root_pose.shape) != (7,) or tuple(root_velocity.shape) != (6,):
+    learner_joint_pos = torch.as_tensor(
+        state["joint_pos_isaac"], device=device, dtype=torch.float32
+    )
+    learner_joint_vel = torch.as_tensor(
+        state["joint_vel_isaac"], device=device, dtype=torch.float32
+    )
+    if tuple(learner_root_pose.shape) != (7,) or tuple(learner_root_velocity.shape) != (6,):
         raise TrackerRecoveryError("proposal learner root state has drifted")
-    if tuple(joint_pos.shape) != (29,) or tuple(joint_vel.shape) != (29,):
+    if tuple(learner_joint_pos.shape) != (29,) or tuple(learner_joint_vel.shape) != (29,):
         raise TrackerRecoveryError("proposal learner joint state has drifted")
+
     frame = int(candidate["frame"])
     motion_cmd.motion_ids.fill_(0)
     motion_cmd.motion_start_time_steps.fill_(frame)
     motion_cmd.time_steps.zero_()
+    reference_root_pose = torch.cat(
+        (motion_cmd.body_pos_w[0, 0], motion_cmd.body_quat_w[0, 0])
+    )
+    reference_root_velocity = torch.cat(
+        (motion_cmd.body_lin_vel_w[0, 0], motion_cmd.body_ang_vel_w[0, 0])
+    )
+    reference_joint_pos = motion_cmd.joint_pos[0]
+    reference_joint_vel = motion_cmd.joint_vel[0]
+    if tuple(reference_joint_pos.shape) != (29,) or tuple(reference_joint_vel.shape) != (29,):
+        raise TrackerRecoveryError("tracker reference joint state has drifted")
+
+    root_pose = torch.empty_like(learner_root_pose)
+    root_pose[:3] = torch.lerp(
+        learner_root_pose[:3], reference_root_pose[:3], reference_blend
+    )
+    root_pose[3:] = _slerp_wxyz(
+        learner_root_pose[3:], reference_root_pose[3:], reference_blend
+    )
+    root_velocity = torch.lerp(
+        learner_root_velocity, reference_root_velocity, reference_blend
+    )
+    joint_pos = torch.lerp(learner_joint_pos, reference_joint_pos, reference_blend)
+    joint_vel = torch.lerp(learner_joint_vel, reference_joint_vel, reference_blend)
+
     robot.write_root_pose_to_sim(root_pose.unsqueeze(0))
     robot.write_root_velocity_to_sim(root_velocity.unsqueeze(0))
     robot.write_joint_state_to_sim(joint_pos.unsqueeze(0), joint_vel.unsqueeze(0))
@@ -316,7 +387,23 @@ def _inject_learner_state(env, robot, motion_cmd, query, candidate, device: str)
     # A fresh observation is required after the teleport.  Reusing reset()
     # observations would silently test a clean reference state instead.
     raw = env.env.observation_manager.compute()
-    return env.process_raw_obs(raw, flatten_dict_obs=True)
+    injected_body_error = (
+        (motion_cmd.body_pos_w - motion_cmd.robot_body_pos_w).norm(dim=-1) * 1000.0
+    )
+    quat_dot = torch.dot(root_pose[3:], reference_root_pose[3:]).abs().clamp(0.0, 1.0)
+    diagnostics = {
+        "reference_blend": reference_blend,
+        "learner_weight": 1.0 - reference_blend,
+        "injected_mpjpe_mm": float(injected_body_error.mean(dim=-1)[0].item()),
+        "injected_root_position_error_m": float(
+            (root_pose[:3] - reference_root_pose[:3]).norm().item()
+        ),
+        "injected_root_rotation_error_rad": float((2.0 * torch.acos(quat_dot)).item()),
+        "injected_joint_position_rmse_rad": float(
+            torch.sqrt(torch.mean((joint_pos - reference_joint_pos) ** 2)).item()
+        ),
+    }
+    return env.process_raw_obs(raw, flatten_dict_obs=True), diagnostics
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -364,8 +451,14 @@ def run(args: argparse.Namespace) -> Path:
     disabled_terminations = _disable_builtin_failure_terminations(env)
     motion_cmd = env.env.command_manager.get_term("motion")
     _place_identity_object(env, motion_lib, args.device)
-    obs = _inject_learner_state(
-        env, robot, motion_cmd, query, candidate, args.device
+    obs, injection = _inject_recovery_state(
+        env,
+        robot,
+        motion_cmd,
+        query,
+        candidate,
+        args.device,
+        reference_blend=args.reference_blend,
     )
     obs = {name: value.to(args.device) for name, value in obs.items()}
 
@@ -428,7 +521,7 @@ def run(args: argparse.Namespace) -> Path:
         fps=np.asarray([50], dtype=np.int64),
     )
     receipt = {
-        "schema": "justin-s13-tracker-recovery-attempt/v1",
+        "schema": "justin-s13-tracker-recovery-attempt/v2",
         "proposal": str(proposal_path),
         "proposal_sha256": _sha256(proposal_path),
         "query_index": int(args.query_index),
@@ -451,7 +544,8 @@ def run(args: argparse.Namespace) -> Path:
         ).strip(),
         "checkpoint_dir": str(checkpoint_dir),
         "checkpoint_sha256": _sha256(checkpoint_dir / "last.pt"),
-        "exact_state_injection": True,
+        "exact_learner_state_injection": args.reference_blend == 0.0,
+        "state_injection": injection,
         "blend_steps": 0,
         "disabled_training_terminations": list(disabled_terminations),
         "urdf_importer_compatibility": {
@@ -487,6 +581,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--episode-length-s", type=float, default=12.0)
     parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument(
+        "--reference-blend",
+        type=validate_reference_blend,
+        default=0.0,
+        help="fraction of the matched tracker reference state injected at handoff",
+    )
     parser.add_argument("--kit-cache", required=True)
     return parser.parse_args(argv)
 

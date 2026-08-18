@@ -1,6 +1,6 @@
 #!/bin/bash
 # One task per seed.  TASK_FILE is a tab-separated, shared-NFS file with:
-# proposal.json <tab> query_index <tab> candidate_index <tab> output_dir <tab> seed
+# proposal.json <tab> query_index <tab> candidate_index <tab> output_dir <tab> seed <tab> reference_blend
 #SBATCH --account=move
 #SBATCH --partition=move
 #SBATCH --nodes=1
@@ -23,8 +23,8 @@ TRACKER=/move/u/justingu/Projects/grail-stairs
 PYTHON=/move/u/justingu/miniconda3/envs/env_isaaclab/bin/python
 [[ -s "$TASK_FILE" && -x "$PYTHON" ]]
 line=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$TASK_FILE")
-IFS=$'\t' read -r proposal query_index candidate_index output seed <<< "$line"
-[[ -n "$proposal" && -n "$query_index" && -n "$candidate_index" && -n "$output" && -n "$seed" ]]
+IFS=$'\t' read -r proposal query_index candidate_index output seed reference_blend <<< "$line"
+[[ -n "$proposal" && -n "$query_index" && -n "$candidate_index" && -n "$output" && -n "$seed" && -n "$reference_blend" ]]
 [[ -s "$proposal" ]]
 if [[ -e "$output" ]]; then
   echo "ownership collision: $output already exists" >&2
@@ -47,4 +47,5 @@ exec "$PYTHON" -u -m mm_sonic.justin_tracker_recovery \
   --tracker-repo "$TRACKER" \
   --checkpoint-dir "$TRACKER/data/sonic_checkpoints/terrain_release" \
   --device cuda:0 --seed "$seed" --episode-length-s 12 \
+  --reference-blend "$reference_blend" \
   --kit-cache "$kit_cache"

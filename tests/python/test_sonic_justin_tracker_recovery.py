@@ -9,8 +9,10 @@ from mm_sonic.justin_tracker_recovery import (
     _compatible_urdf_extension_name,
     _disable_builtin_failure_terminations,
     _kit_cache_args,
+    _slerp_wxyz,
     evaluate_tracker_attempt,
     select_proposal_candidate,
+    validate_reference_blend,
 )
 
 
@@ -68,6 +70,36 @@ def test_select_proposal_candidate_is_strict() -> None:
     assert candidate["frame"] == 10
     with pytest.raises(TrackerRecoveryError, match="out of range"):
         select_proposal_candidate(_proposal(), query_index=1, candidate_index=0)
+
+
+@pytest.mark.parametrize("value", [0.0, 0.25, 1.0])
+def test_reference_blend_accepts_closed_unit_interval(value: float) -> None:
+    assert validate_reference_blend(value) == value
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, np.nan, np.inf])
+def test_reference_blend_rejects_invalid_values(value: float) -> None:
+    with pytest.raises(TrackerRecoveryError, match=r"in \[0, 1\]"):
+        validate_reference_blend(value)
+
+
+def test_quaternion_blend_uses_shortest_arc() -> None:
+    import torch
+
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    same_rotation_opposite_sign = -identity
+    halfway = _slerp_wxyz(identity, same_rotation_opposite_sign, 0.5)
+    assert torch.allclose(halfway, identity)
+
+    half_turn = torch.tensor([0.0, 0.0, 0.0, 1.0])
+    quarter_turn = _slerp_wxyz(identity, half_turn, 0.5)
+    assert torch.allclose(
+        quarter_turn,
+        torch.tensor(
+            [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)], dtype=quarter_turn.dtype
+        ),
+        atol=1.0e-6,
+    )
 
 
 def test_tracker_acceptance_requires_screen_completion_and_stable_top() -> None:
