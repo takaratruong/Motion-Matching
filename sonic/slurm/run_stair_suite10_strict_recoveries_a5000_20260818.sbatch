@@ -8,7 +8,9 @@
 #SBATCH --mem=64G
 #SBATCH --time=01:00:00
 #SBATCH --gres=gpu:a5000:1
-#SBATCH --array=0-74%4
+# Isaac Kit writes shared package configuration during startup; concurrent
+# processes on one node can deadlock in its global read/write lock.
+#SBATCH --array=0-74%1
 #SBATCH --job-name=stair10-recover
 #SBATCH --output=/move/u/bodow/outputs/justin_recovery_test/dense_epoch2_state41/stair_suite10_v2_corrected/slurm_logs/%x-%A_%a.out
 #SBATCH --error=/move/u/bodow/outputs/justin_recovery_test/dense_epoch2_state41/stair_suite10_v2_corrected/slurm_logs/%x-%A_%a.err
