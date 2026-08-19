@@ -22,7 +22,7 @@ from typing import Mapping
 
 import numpy as np
 
-from .justin_recovery import TRACKER_HISTORY_FRAMES
+from .justin_recovery import S13_REFERENCE_FRONT_XY, TRACKER_HISTORY_FRAMES
 
 
 TRACKER_SCREEN_STEPS = 25
@@ -335,6 +335,7 @@ def select_proposal_candidate(
         "justin-s13-tracker-recovery-proposal/v1",
         "justin-s13-tracker-recovery-proposal/v2",
         "justin-s13-tracker-recovery-proposal/v3",
+        "tracker-recovery-proposal/v4",
     }:
         raise TrackerRecoveryError("unsupported recovery proposal schema")
     try:
@@ -352,6 +353,7 @@ def evaluate_tracker_attempt(
     terminated_early: bool,
     screen_steps: int = TRACKER_SCREEN_STEPS,
     completed_reference: bool,
+    platform_contract: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     mpjpe = np.asarray(mpjpe_mm, dtype=np.float64)
     root_position = np.asarray(root_position_m, dtype=np.float64)
@@ -370,21 +372,35 @@ def evaluate_tracker_attempt(
     screen_pass = bool(
         screened and not terminated_early and screen_peak <= TRACKER_MPJPE_LIMIT_MM
     )
-    tail = root_position[-min(len(root_position), STABLE_TOP_TAIL_STEPS) :]
-    tail_on_platform = (
-        (tail[:, 0] <= JUSTIN_PLATFORM_ENTRY_X_M)
-        & (tail[:, 1] >= JUSTIN_PLATFORM_Y_MIN_M)
-        & (tail[:, 1] <= JUSTIN_PLATFORM_Y_MAX_M)
-        & (tail[:, 2] >= JUSTIN_PLATFORM_ROOT_Z_M)
-    )
-    reached_platform = bool(
-        np.any(
-            (root_position[:, 0] <= JUSTIN_PLATFORM_ENTRY_X_M)
-            & (root_position[:, 1] >= JUSTIN_PLATFORM_Y_MIN_M)
-            & (root_position[:, 1] <= JUSTIN_PLATFORM_Y_MAX_M)
-            & (root_position[:, 2] >= JUSTIN_PLATFORM_ROOT_Z_M)
+    contract = {
+        "front_xy": S13_REFERENCE_FRONT_XY.tolist(),
+        "heading_yaw_rad": np.pi,
+        "top_progress_min_m": S13_REFERENCE_FRONT_XY[0] - JUSTIN_PLATFORM_ENTRY_X_M,
+        "lateral_half_width_m": 0.5,
+        "root_z_min_m": JUSTIN_PLATFORM_ROOT_Z_M,
+    }
+    if platform_contract is not None:
+        contract.update(platform_contract)
+    front = np.asarray(contract["front_xy"], dtype=np.float64)
+    heading_yaw = float(contract["heading_yaw_rad"])
+    if front.shape != (2,) or not np.isfinite(front).all() or not np.isfinite(heading_yaw):
+        raise TrackerRecoveryError("platform evaluation frame is invalid")
+    forward = np.asarray((np.cos(heading_yaw), np.sin(heading_yaw)))
+    lateral = np.asarray((-np.sin(heading_yaw), np.cos(heading_yaw)))
+
+    def on_platform(position: np.ndarray) -> np.ndarray:
+        delta = position[:, :2] - front
+        progress = delta @ forward
+        lateral_offset = delta @ lateral
+        return (
+            (progress >= float(contract["top_progress_min_m"]))
+            & (np.abs(lateral_offset) <= float(contract["lateral_half_width_m"]))
+            & (position[:, 2] >= float(contract["root_z_min_m"]))
         )
-    )
+
+    tail = root_position[-min(len(root_position), STABLE_TOP_TAIL_STEPS) :]
+    tail_on_platform = on_platform(tail)
+    reached_platform = bool(np.any(on_platform(root_position)))
     stable_platform = bool(
         completed_reference
         and len(tail) == STABLE_TOP_TAIL_STEPS
@@ -448,7 +464,11 @@ def evaluate_second_stage_recovery(
 
 
 def _build_single_clip_bundle(
-    *, tracker_repo: Path, reference_npz: Path, output: Path
+    *,
+    tracker_repo: Path,
+    reference_npz: Path,
+    output: Path,
+    object_usd: Path | None = None,
 ) -> tuple[Path, Path, str]:
     """Build the tracker-native PKL without changing the production repository."""
     import joblib
@@ -462,23 +482,44 @@ def _build_single_clip_bundle(
 
     clip = reference_npz.stem
     csv_path = reference_npz.parent.parent / f"{clip}.csv"
-    if not csv_path.is_file():
-        raise TrackerRecoveryError(f"missing native Justin CSV: {csv_path}")
-    object_usd = tracker_repo / "data/sonic_stairs/staircase13x7platform.usd"
+    object_usd = (
+        tracker_repo / "data/sonic_stairs/staircase13x7platform.usd"
+        if object_usd is None
+        else object_usd.resolve()
+    )
     if not object_usd.is_file():
-        raise TrackerRecoveryError(f"missing Justin tracker USD: {object_usd}")
+        raise TrackerRecoveryError(f"missing tracker USD: {object_usd}")
     bundle = output / "tracker_bundle"
     robot_dir = bundle / "robot"
     object_dir = bundle / "object_usd"
     robot_dir.mkdir(parents=True, exist_ok=True)
     object_dir.mkdir(parents=True, exist_ok=True)
     spec = load_spec()
-    permutation = csv_joint_permutation(CSV_JOINT_ORDER, spec.joint_names)
-    csv = np.loadtxt(csv_path, delimiter=",", dtype=np.float32)
-    quat = csv[:, 3:7]
+    if csv_path.is_file():
+        permutation = csv_joint_permutation(CSV_JOINT_ORDER, spec.joint_names)
+        csv = np.loadtxt(csv_path, delimiter=",", dtype=np.float32)
+        root_pos = csv[:, :3]
+        quat = csv[:, 3:7]
+        dof_mujoco = csv[:, 7:36][:, permutation]
+        fps = 30.0
+    else:
+        from .grail_terrain_source import ISAACLAB_JOINT_NAMES
+
+        with np.load(reference_npz, allow_pickle=False) as reference:
+            root_pos = np.asarray(reference["body_pos_w"][:, 0], dtype=np.float32)
+            root_wxyz = np.asarray(
+                reference["body_quat_w"][:, 0], dtype=np.float32
+            )
+            quat = root_wxyz[:, (1, 2, 3, 0)]
+            joints = np.asarray(reference["joint_pos"], dtype=np.float32)
+            fps = float(np.asarray(reference["fps"]).reshape(-1)[0])
+        permutation = csv_joint_permutation(
+            list(ISAACLAB_JOINT_NAMES), spec.joint_names
+        )
+        dof_mujoco = joints[:, permutation]
     quat /= np.linalg.norm(quat, axis=1, keepdims=True)
     entry = build_entry(
-        csv[:, :3], quat, csv[:, 7:36][:, permutation], spec.dof_axis, 30.0
+        root_pos, quat, dof_mujoco, spec.dof_axis, fps
     )
     motion_file = bundle / f"motion_lib_{clip}.pkl"
     joblib.dump({clip: entry}, motion_file)
@@ -487,7 +528,7 @@ def _build_single_clip_bundle(
     shutil.copy2(object_usd, bundle / "flat_placeholder.usd")
     (bundle / "clips.json").write_text(
         json.dumps(
-            [{"stem": clip, "terrain": "stairs", "n_frames": len(csv), "fps": 30}],
+            [{"stem": clip, "terrain": "stairs", "n_frames": len(root_pos), "fps": fps}],
             indent=2,
         )
         + "\n"
@@ -861,7 +902,10 @@ def run(args: argparse.Namespace) -> Path:
         raise TrackerRecoveryError(f"not a tracker repository: {tracker_repo}")
     sys.path.insert(0, str(tracker_repo))
     bundle, motion_file, clip = _build_single_clip_bundle(
-        tracker_repo=tracker_repo, reference_npz=reference, output=output
+        tracker_repo=tracker_repo,
+        reference_npz=reference,
+        output=output,
+        object_usd=(None if args.object_usd is None else Path(args.object_usd)),
     )
 
     import torch
@@ -891,7 +935,10 @@ def run(args: argparse.Namespace) -> Path:
     motion_cmd = env.env.command_manager.get_term("motion")
     _place_identity_object(env, motion_lib, args.device)
     if args.exact_learner_handoff:
-        if proposal.get("schema") != "justin-s13-tracker-recovery-proposal/v3":
+        if proposal.get("schema") not in {
+            "justin-s13-tracker-recovery-proposal/v3",
+            "tracker-recovery-proposal/v4",
+        }:
             raise TrackerRecoveryError(
                 "exact learner handoff requires a v3 proposal with learner history"
             )
@@ -1103,6 +1150,7 @@ def run(args: argparse.Namespace) -> Path:
         root_position_m=root_pos_a,
         terminated_early=terminated_early,
         completed_reference=completed_reference,
+        platform_contract=proposal.get("evaluation_geometry"),
     )
     second_stage_evaluation = (
         evaluate_second_stage_recovery(
@@ -1206,6 +1254,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--tracker-repo", default="/move/u/justingu/Projects/grail-stairs"
+    )
+    parser.add_argument(
+        "--object-usd",
+        help="terrain USD paired with a synthesized non-Justin reference",
     )
     parser.add_argument(
         "--checkpoint-dir",

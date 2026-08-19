@@ -77,6 +77,15 @@ def test_select_proposal_candidate_accepts_command_matched_schema() -> None:
     assert candidate["frame"] == 10
 
 
+def test_select_proposal_candidate_accepts_generic_scene_schema() -> None:
+    proposal = _proposal()
+    proposal["schema"] = "tracker-recovery-proposal/v4"
+    _, candidate = select_proposal_candidate(
+        proposal, query_index=0, candidate_index=0
+    )
+    assert candidate["frame"] == 10
+
+
 def _exact_history_query() -> dict:
     state = {
         "root_pose_wxyz": [0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0],
@@ -174,6 +183,25 @@ def test_tracker_acceptance_requires_screen_completion_and_stable_top() -> None:
     assert accepted["reached_platform"] is True
     assert accepted["stable_platform"] is True
     assert accepted["stable_top"] is True
+    assert accepted["accepted_recovery"] is True
+
+
+def test_tracker_acceptance_uses_generic_ten_step_platform_geometry() -> None:
+    platform_root = np.tile(np.asarray((3.2, 0.0, 2.4)), (60, 1))
+    accepted = evaluate_tracker_attempt(
+        mpjpe_mm=np.full(60, 120.0),
+        root_position_m=platform_root,
+        terminated_early=False,
+        completed_reference=True,
+        platform_contract={
+            "front_xy": [0.0, 0.0],
+            "heading_yaw_rad": 0.0,
+            "top_progress_min_m": 2.97671625,
+            "lateral_half_width_m": 0.6473596816,
+            "root_z_min_m": 2.25,
+        },
+    )
+    assert accepted["stable_platform"] is True
     assert accepted["accepted_recovery"] is True
 
 

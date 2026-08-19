@@ -11,7 +11,13 @@ from typing import Mapping
 
 import numpy as np
 
-from .justin_recovery import RecoveryQuery, learner_state_in_reference_frame, load_recovery_trace
+from .justin_recovery import (
+    DEFAULT_S13_SCENE,
+    RecoveryQuery,
+    RecoverySceneContract,
+    learner_state_in_reference_frame,
+    load_recovery_trace,
+)
 from .render_justin_tracker_rollout import (
     ARTICULATION_JOINT_NAMES,
     DEFAULT_MODEL_PATH,
@@ -48,7 +54,24 @@ def _load_contract(proposal_path: Path, attempt: Path) -> tuple[dict, dict, dict
     return proposal, query, receipt
 
 
-def _learner_motion(proposal: Mapping[str, object]) -> StitchedMotion:
+def _scene_contract(proposal: Mapping[str, object]) -> RecoverySceneContract:
+    payload = proposal.get("scene_transform")
+    if not isinstance(payload, Mapping):
+        return DEFAULT_S13_SCENE
+    return RecoverySceneContract(
+        scene_id=str(payload["scene_id"]),
+        learner_front_xy=tuple(map(float, payload["learner_front_xy"])),
+        reference_front_xy=tuple(map(float, payload["reference_front_xy"])),
+        learner_heading_yaw_rad=float(payload["learner_heading_yaw_rad"]),
+        reference_heading_yaw_rad=float(payload["reference_heading_yaw_rad"]),
+        tread_m=float(payload["tread_m"]),
+        num_steps=int(payload["num_steps"]),
+    )
+
+
+def _learner_motion(
+    proposal: Mapping[str, object], scene: RecoverySceneContract
+) -> StitchedMotion:
     trace_path = Path(str(proposal["trace_path"])).resolve()
     trace = load_recovery_trace(trace_path)
     if trace.sha256 != proposal["trace_sha256"]:
@@ -62,7 +85,7 @@ def _learner_motion(proposal: Mapping[str, object]) -> StitchedMotion:
             physics_step=int(physics_step),
             history_start=max(0, index - 19),
         )
-        state = learner_state_in_reference_frame(trace, query)
+        state = learner_state_in_reference_frame(trace, query, scene)
         roots.append(state["root_pose_wxyz"][:3])
         quaternions.append(state["root_pose_wxyz"][3:])
     frame_count = len(roots)
@@ -156,11 +179,12 @@ def render_comparison(
     proposal_path = proposal_path.resolve()
     attempt = attempt.resolve()
     proposal, query, receipt = _load_contract(proposal_path, attempt)
-    learner = _learner_motion(proposal)
+    scene = _scene_contract(proposal)
+    learner = _learner_motion(proposal, scene)
     recovered, seam = _recovered_motion(learner, query, attempt)
     usd_paths = tuple((attempt / "tracker_bundle" / "object_usd").glob("*.usd"))
     if len(usd_paths) != 1:
-        raise ValueError("attempt does not contain exactly one Justin USD")
+        raise ValueError("attempt does not contain exactly one terrain USD")
     identity = RigidTransform(
         np.zeros(3, dtype=np.float32),
         np.asarray((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
@@ -194,7 +218,7 @@ def render_comparison(
         "proposal": str(proposal_path),
         "attempt": str(attempt),
         "trace": str(proposal["trace_path"]),
-        "approach_distance_m": 3.0,
+        "scene": scene.to_json(),
         "query_index": int(receipt["query_index"]),
         "candidate_index": int(receipt["candidate_index"]),
         "rewind_s": float(receipt["rewind_s"]),

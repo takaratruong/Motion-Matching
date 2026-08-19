@@ -56,6 +56,60 @@ S13_LEARNER_FRONT_XY = np.asarray((3.0, 0.0), dtype=np.float64)
 S13_REFERENCE_FRONT_XY = np.asarray((-0.21065, -4.3529), dtype=np.float64)
 S13_SCENE_YAW_DELTA_RAD = math.pi
 
+
+@dataclass(frozen=True)
+class RecoverySceneContract:
+    """Planar alignment and stair progress contract for one recovery scene."""
+
+    scene_id: str
+    learner_front_xy: tuple[float, float]
+    reference_front_xy: tuple[float, float]
+    learner_heading_yaw_rad: float
+    reference_heading_yaw_rad: float
+    tread_m: float
+    num_steps: int
+
+    def __post_init__(self) -> None:
+        if len(self.learner_front_xy) != 2 or len(self.reference_front_xy) != 2:
+            raise ValueError("recovery scene fronts must be two-dimensional")
+        values = np.asarray(
+            (*self.learner_front_xy, *self.reference_front_xy,
+             self.learner_heading_yaw_rad, self.reference_heading_yaw_rad,
+             self.tread_m),
+            dtype=np.float64,
+        )
+        if not self.scene_id or not np.isfinite(values).all():
+            raise ValueError("recovery scene contract is not finite")
+        if self.tread_m <= 0.0 or self.num_steps < 1:
+            raise ValueError("recovery scene needs positive stair geometry")
+
+    @property
+    def yaw_delta_rad(self) -> float:
+        return self.reference_heading_yaw_rad - self.learner_heading_yaw_rad
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "scene_id": self.scene_id,
+            "learner_front_xy": list(self.learner_front_xy),
+            "reference_front_xy": list(self.reference_front_xy),
+            "learner_heading_yaw_rad": self.learner_heading_yaw_rad,
+            "reference_heading_yaw_rad": self.reference_heading_yaw_rad,
+            "yaw_delta_rad": self.yaw_delta_rad,
+            "tread_m": self.tread_m,
+            "num_steps": self.num_steps,
+        }
+
+
+DEFAULT_S13_SCENE = RecoverySceneContract(
+    scene_id="justin_s13",
+    learner_front_xy=tuple(S13_LEARNER_FRONT_XY),
+    reference_front_xy=tuple(S13_REFERENCE_FRONT_XY),
+    learner_heading_yaw_rad=0.0,
+    reference_heading_yaw_rad=math.pi,
+    tread_m=S13_TREAD_M,
+    num_steps=3,
+)
+
 REQUIRED_TRACE_FIELDS = {
     "physics_step": (),
     "policy_call_index": (),
@@ -237,11 +291,15 @@ def load_reference_clip(path: str | Path) -> ReferenceClip:
     return ReferenceClip(source, source.stem, arrays, _sha256(source))
 
 
-def load_reference_bank(paths: Iterable[str | Path]) -> tuple[ReferenceClip, ...]:
+def load_reference_bank(
+    paths: Iterable[str | Path], *, minimum_clips: int = 4
+) -> tuple[ReferenceClip, ...]:
     clips = tuple(load_reference_clip(path) for path in paths)
-    if not 4 <= len(clips) <= 8:
+    if minimum_clips not in {1, 4}:
+        raise RecoveryContractError("reference bank minimum must be one or four")
+    if not minimum_clips <= len(clips) <= 8:
         raise RecoveryContractError(
-            f"Justin recovery bank must contain 4..8 clips, got {len(clips)}"
+            f"recovery bank must contain {minimum_clips}..8 clips, got {len(clips)}"
         )
     names = [clip.name for clip in clips]
     if len(set(names)) != len(names):
@@ -326,21 +384,25 @@ def _rotate_xy(value: np.ndarray, yaw: np.ndarray | float) -> np.ndarray:
     )
 
 
-def learner_xy_to_reference(xy: np.ndarray) -> np.ndarray:
+def learner_xy_to_reference(
+    xy: np.ndarray, scene: RecoverySceneContract = DEFAULT_S13_SCENE
+) -> np.ndarray:
     source = np.asarray(xy, dtype=np.float64)
-    return S13_REFERENCE_FRONT_XY + _rotate_xy(
-        source - S13_LEARNER_FRONT_XY, S13_SCENE_YAW_DELTA_RAD
+    return np.asarray(scene.reference_front_xy) + _rotate_xy(
+        source - np.asarray(scene.learner_front_xy), scene.yaw_delta_rad
     )
 
 
 def learner_state_in_reference_frame(
-    trace: RecoveryTrace, query: RecoveryQuery
+    trace: RecoveryTrace,
+    query: RecoveryQuery,
+    scene: RecoverySceneContract = DEFAULT_S13_SCENE,
 ) -> dict[str, np.ndarray]:
     """Return exact learner state, changed only by the scene's planar rigid transform."""
     i = query.trace_index
     qpos = np.asarray(trace.arrays["qpos_mujoco"][i], dtype=np.float64).copy()
-    qpos[:2] = learner_xy_to_reference(qpos[:2])
-    half = 0.5 * S13_SCENE_YAW_DELTA_RAD
+    qpos[:2] = learner_xy_to_reference(qpos[:2], scene)
+    half = 0.5 * scene.yaw_delta_rad
     yaw_quat = np.asarray((math.cos(half), 0.0, 0.0, math.sin(half)))
     root_quat = qpos[3:7].copy()
     # Hamilton product: fixed world-yaw rotation * learner root orientation.
@@ -359,8 +421,8 @@ def learner_state_in_reference_frame(
     root_angular = np.asarray(
         trace.arrays["body_ang_vel_world_mujoco"][i, root_body], dtype=np.float64
     ).copy()
-    root_linear[:2] = _rotate_xy(root_linear[:2], S13_SCENE_YAW_DELTA_RAD)
-    root_angular[:2] = _rotate_xy(root_angular[:2], S13_SCENE_YAW_DELTA_RAD)
+    root_linear[:2] = _rotate_xy(root_linear[:2], scene.yaw_delta_rad)
+    root_angular[:2] = _rotate_xy(root_angular[:2], scene.yaw_delta_rad)
     return {
         "root_pose_wxyz": np.concatenate((qpos[:3], qpos[3:7])).astype(np.float32),
         "root_velocity_world": np.concatenate((root_linear, root_angular)).astype(np.float32),
@@ -370,7 +432,9 @@ def learner_state_in_reference_frame(
 
 
 def learner_tracker_history_in_reference_frame(
-    trace: RecoveryTrace, query: RecoveryQuery
+    trace: RecoveryTrace,
+    query: RecoveryQuery,
+    scene: RecoverySceneContract = DEFAULT_S13_SCENE,
 ) -> list[dict[str, object]]:
     """Return the exact chronological learner inputs needed by the tracker.
 
@@ -390,7 +454,7 @@ def learner_tracker_history_in_reference_frame(
             physics_step=int(trace.arrays["physics_step"][trace_index]),
             history_start=max(0, trace_index - HISTORY_FRAMES + 1),
         )
-        state = learner_state_in_reference_frame(trace, history_query)
+        state = learner_state_in_reference_frame(trace, history_query, scene)
         action = np.asarray(
             trace.arrays["action_isaac_normalized"][trace_index],
             dtype=np.float32,
@@ -410,6 +474,16 @@ def _heading_local(vector: np.ndarray, yaw: np.ndarray) -> np.ndarray:
     result = np.asarray(vector, dtype=np.float64).copy()
     result[..., :2] = _rotate_xy(result[..., :2], -yaw)
     return result
+
+
+def _scene_progress(
+    xy: np.ndarray, *, front_xy: tuple[float, float], heading_yaw_rad: float
+) -> np.ndarray:
+    delta = np.asarray(xy, dtype=np.float64) - np.asarray(front_xy, dtype=np.float64)
+    heading = np.asarray(
+        (math.cos(heading_yaw_rad), math.sin(heading_yaw_rad)), dtype=np.float64
+    )
+    return np.sum(delta * heading, axis=-1)
 
 
 def _support_label(left: bool, right: bool) -> str:
@@ -435,12 +509,21 @@ def _reference_support(clip: ReferenceClip) -> np.ndarray:
     return labels
 
 
-def _terrain_stage(progress_m: np.ndarray | float) -> np.ndarray:
+def _terrain_stage(
+    progress_m: np.ndarray | float,
+    *,
+    tread_m: float = S13_TREAD_M,
+    num_steps: int = 3,
+) -> np.ndarray:
     progress = np.asarray(progress_m, dtype=np.float64)
     return np.where(
         progress < 0.0,
         0,
-        np.clip(np.floor(progress / S13_TREAD_M).astype(np.int64) + 1, 1, 3),
+        np.clip(
+            np.floor(progress / float(tread_m)).astype(np.int64) + 1,
+            1,
+            int(num_steps),
+        ),
     ).astype(np.int64)
 
 
@@ -541,6 +624,7 @@ def rank_recovery_candidates(
     clips: Sequence[ReferenceClip],
     *,
     top_k: int = DEFAULT_TOP_K,
+    scene: RecoverySceneContract = DEFAULT_S13_SCENE,
 ) -> tuple[RecoveryCandidate, ...]:
     """Hard-filter Justin ascent rows, then rank 0.4 s pose/velocity histories."""
     if top_k <= 0:
@@ -562,8 +646,18 @@ def rank_recovery_candidates(
         bool(a["left_foot_contact"][i]) or left_speed < 0.16,
         bool(a["right_foot_contact"][i]) or right_speed < 0.16,
     )
-    query_progress = float(a["qpos_mujoco"][i, 0] - S13_LEARNER_FRONT_XY[0])
-    query_stage = int(_terrain_stage(query_progress))
+    query_progress = float(
+        _scene_progress(
+            a["qpos_mujoco"][i, :2],
+            front_xy=scene.learner_front_xy,
+            heading_yaw_rad=scene.learner_heading_yaw_rad,
+        )
+    )
+    query_stage = int(
+        _terrain_stage(
+            query_progress, tread_m=scene.tread_m, num_steps=scene.num_steps
+        )
+    )
 
     candidates: list[RecoveryCandidate] = []
     for clip in clips:
@@ -571,8 +665,14 @@ def rank_recovery_candidates(
             clip.arrays["body_pos_w"][:, REFERENCE_ROOT_BODY], dtype=np.float64
         )
         root_z = root_position[:, 2]
-        progress = S13_REFERENCE_FRONT_XY[0] - root_position[:, 0]
-        stages = _terrain_stage(progress)
+        progress = _scene_progress(
+            root_position[:, :2],
+            front_xy=scene.reference_front_xy,
+            heading_yaw_rad=scene.reference_heading_yaw_rad,
+        )
+        stages = _terrain_stage(
+            progress, tread_m=scene.tread_m, num_steps=scene.num_steps
+        )
         support = _reference_support(clip)
         clip_task12 = {
             frame: reference_task12(clip, frame).astype(np.float64)
@@ -621,7 +721,7 @@ def rank_recovery_candidates(
                 np.sum(weights * (query_feet - ref_feet) ** 2) / np.sum(weights)
             )
             stage_cost = float(
-                ((float(progress[frame]) - query_progress) / S13_TREAD_M) ** 2
+                ((float(progress[frame]) - query_progress) / scene.tread_m) ** 2
             )
             total = (
                 pose_cost
@@ -667,6 +767,7 @@ def build_recovery_proposal(
     failure_source: str = "reported_first_fall",
     rewinds_s: Sequence[float] = DEFAULT_REWINDS_S,
     top_k: int = DEFAULT_TOP_K,
+    scene: RecoverySceneContract = DEFAULT_S13_SCENE,
 ) -> dict[str, object]:
     if failure_source not in {"reported_first_fall", "terminal_degradation"}:
         raise RecoveryContractError(f"unsupported failure source {failure_source!r}")
@@ -675,7 +776,7 @@ def build_recovery_proposal(
     )
     query_rows: list[dict[str, object]] = []
     for query in queries:
-        state = learner_state_in_reference_frame(trace, query)
+        state = learner_state_in_reference_frame(trace, query, scene)
         row: dict[str, object] = {
             "rewind_s": query.rewind_s,
             "trace_index": query.trace_index,
@@ -683,14 +784,21 @@ def build_recovery_proposal(
             "history_start": query.history_start,
             "learner_state": {name: value.tolist() for name, value in state.items()},
             "learner_tracker_history": learner_tracker_history_in_reference_frame(
-                trace, query
+                trace, query, scene
             ),
             "learner_task12": np.asarray(
                 trace.arrays["task12"][query.trace_index], dtype=np.float32
             ).tolist(),
         }
         try:
-            candidates = rank_recovery_candidates(trace, query, clips, top_k=top_k)
+            if scene == DEFAULT_S13_SCENE:
+                candidates = rank_recovery_candidates(
+                    trace, query, clips, top_k=top_k
+                )
+            else:
+                candidates = rank_recovery_candidates(
+                    trace, query, clips, top_k=top_k, scene=scene
+                )
         except RecoveryContractError as error:
             # A rejected rewind is evidence about match feasibility, not a reason
             # to discard valid candidates at the other rewind horizons.
@@ -702,7 +810,11 @@ def build_recovery_proposal(
     if not any(row["candidates"] for row in query_rows):
         raise RecoveryContractError("no Justin reference candidate survived any rewind")
     return {
-        "schema": "justin-s13-tracker-recovery-proposal/v3",
+        "schema": (
+            "justin-s13-tracker-recovery-proposal/v3"
+            if scene == DEFAULT_S13_SCENE
+            else "tracker-recovery-proposal/v4"
+        ),
         "trace_path": str(trace.path),
         "trace_sha256": trace.sha256,
         "first_fall_physics_step": (
@@ -737,9 +849,7 @@ def build_recovery_proposal(
         "matching_only": True,
         "fine_tuning_performed": False,
         "scene_transform": {
-            "learner_front_xy": S13_LEARNER_FRONT_XY.tolist(),
-            "reference_front_xy": S13_REFERENCE_FRONT_XY.tolist(),
-            "yaw_delta_rad": S13_SCENE_YAW_DELTA_RAD,
+            **scene.to_json(),
         },
         "reference_bank": [
             {

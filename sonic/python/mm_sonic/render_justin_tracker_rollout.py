@@ -56,7 +56,7 @@ ARTICULATION_JOINT_NAMES = (
 
 
 def _combined_usd_mesh(path: Path) -> CanonicalTerrainMesh:
-    """Load every mesh prim because Justin's USD has three steps plus a platform."""
+    """Load every mesh prim so multi-box stair scenes render as one terrain."""
 
     try:
         from pxr import Gf, Usd, UsdGeom
@@ -70,7 +70,7 @@ def _combined_usd_mesh(path: Path) -> CanonicalTerrainMesh:
         UsdGeom.GetStageUpAxis(stage) != UsdGeom.Tokens.z
         or UsdGeom.GetStageMetersPerUnit(stage) != 1.0
     ):
-        raise ValueError("Justin USD must declare Z up and metersPerUnit=1")
+        raise ValueError("terrain USD must declare Z up and metersPerUnit=1")
 
     vertices: list[np.ndarray] = []
     faces: list[tuple[int, int, int]] = []
@@ -110,7 +110,7 @@ def _combined_usd_mesh(path: Path) -> CanonicalTerrainMesh:
         vertex_offset += len(points)
 
     if not vertices or not faces:
-        raise ValueError(f"Justin USD contains no renderable mesh: {path}")
+        raise ValueError(f"terrain USD contains no renderable mesh: {path}")
     face_array = np.asarray(faces, dtype=np.int32)
     return CanonicalTerrainMesh(
         vertices_local=np.asarray(vertices, dtype=np.float32),

@@ -5,6 +5,7 @@ import numpy as np
 from mm_sonic.render_justin_recovery_comparison import (
     _camera_offset_for_absolute_azimuth,
     _recovered_motion,
+    _scene_contract,
 )
 from mm_sonic.terrain_oracle.stitch import FrameProvenance, StitchedMotion
 
@@ -62,3 +63,23 @@ def test_camera_offset_produces_requested_absolute_azimuth() -> None:
     learner = _learner_motion()
     offset = _camera_offset_for_absolute_azimuth(learner, 270.0)
     assert offset == 270.0
+
+
+def test_scene_contract_uses_generic_proposal_transform() -> None:
+    scene = _scene_contract(
+        {
+            "scene_transform": {
+                "scene_id": "karen10_d150",
+                "learner_front_xy": [1.5, 0.0],
+                "reference_front_xy": [0.0, 0.0],
+                "learner_heading_yaw_rad": 0.0,
+                "reference_heading_yaw_rad": 0.0,
+                "tread_m": 0.33074625,
+                "num_steps": 10,
+            }
+        }
+    )
+
+    assert scene.scene_id == "karen10_d150"
+    assert scene.learner_front_xy == (1.5, 0.0)
+    assert scene.num_steps == 10

@@ -1,0 +1,16 @@
+{
+  "scene_id": "karen10_d150",
+  "learner_front_xy": [1.5, 0.0],
+  "reference_front_xy": [0.0, 0.0],
+  "learner_heading_yaw_rad": 0.0,
+  "reference_heading_yaw_rad": 0.0,
+  "tread_m": 0.33074625,
+  "num_steps": 10,
+  "evaluation_geometry": {
+    "front_xy": [0.0, 0.0],
+    "heading_yaw_rad": 0.0,
+    "top_progress_min_m": 2.97671625,
+    "lateral_half_width_m": 0.6473596816,
+    "root_z_min_m": 2.25
+  }
+}

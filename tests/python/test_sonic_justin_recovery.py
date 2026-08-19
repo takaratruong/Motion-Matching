@@ -10,6 +10,7 @@ import mm_sonic.justin_recovery as justin_recovery
 from mm_sonic.justin_recovery import (
     HISTORY_FRAMES,
     TRACKER_HISTORY_FRAMES,
+    RecoverySceneContract,
     RecoveryContractError,
     build_recovery_proposal,
     learner_state_in_reference_frame,
@@ -156,6 +157,42 @@ def test_scene_transform_preserves_learner_offset(tmp_path: Path) -> None:
     assert state["joint_pos_isaac"].shape == (29,)
     # pi world-yaw transform turns +X learner velocity into -X reference velocity.
     assert state["root_velocity_world"][0] == pytest.approx(-0.5)
+
+
+def test_generic_scene_transform_aligns_variable_approach_to_local_mesh() -> None:
+    scene = RecoverySceneContract(
+        scene_id="karen10",
+        learner_front_xy=(1.5, 0.0),
+        reference_front_xy=(0.0, 0.0),
+        learner_heading_yaw_rad=0.0,
+        reference_heading_yaw_rad=0.0,
+        tread_m=0.33074625,
+        num_steps=10,
+    )
+
+    np.testing.assert_allclose(
+        learner_xy_to_reference(np.asarray((3.8, 0.1)), scene),
+        (2.3, 0.1),
+    )
+
+
+def test_generic_scene_contract_rejects_non_planar_front() -> None:
+    with pytest.raises(ValueError, match="two-dimensional"):
+        RecoverySceneContract(
+            scene_id="bad",
+            learner_front_xy=(0.0, 0.0, 0.0),
+            reference_front_xy=(0.0, 0.0),
+            learner_heading_yaw_rad=0.0,
+            reference_heading_yaw_rad=0.0,
+            tread_m=0.3,
+            num_steps=10,
+        )
+
+
+def test_single_synthesized_reference_is_explicitly_opt_in(tmp_path: Path) -> None:
+    reference = _write_reference(tmp_path / "synthesized.npz")
+
+    assert load_reference_bank([reference], minimum_clips=1)[0].name == "synthesized"
 
 
 def test_tracker_history_is_exact_chronological_learner_history(
