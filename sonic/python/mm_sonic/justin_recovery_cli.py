@@ -58,6 +58,11 @@ def main() -> None:
             reference_heading_yaw_rad=float(payload["reference_heading_yaw_rad"]),
             tread_m=float(payload["tread_m"]),
             num_steps=int(payload["num_steps"]),
+            riser_progress_m=tuple(payload.get("riser_progress_m", ())),
+            geometry_sha256=payload.get("geometry_sha256"),
+            exact_command_required=bool(
+                payload.get("exact_command_required", False)
+            ),
         )
     proposal = build_recovery_proposal(
         trace,

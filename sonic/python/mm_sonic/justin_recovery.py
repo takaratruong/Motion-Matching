@@ -39,6 +39,7 @@ TASK12_OFFSETS = np.asarray((6, 12, 18, 24), dtype=np.int64)
 COMMAND_KNOT_RMSE_LIMIT = 0.20
 COMMAND_MEAN_PLANAR_ERROR_LIMIT = 0.20
 COMMAND_MEAN_YAW_RATE_ERROR_LIMIT = 0.15
+EXACT_COMMAND_MAX_ABS_ERROR = 0.0
 COMMAND_COST_SCALE = np.asarray((0.20, 0.20, 0.30), dtype=np.float64)
 
 # The trace drops MuJoCo's world body via ``data.xpos[1:31]``.  These are
@@ -68,6 +69,9 @@ class RecoverySceneContract:
     reference_heading_yaw_rad: float
     tread_m: float
     num_steps: int
+    riser_progress_m: tuple[float, ...] = ()
+    geometry_sha256: str | None = None
+    exact_command_required: bool = False
 
     def __post_init__(self) -> None:
         if len(self.learner_front_xy) != 2 or len(self.reference_front_xy) != 2:
@@ -82,6 +86,24 @@ class RecoverySceneContract:
             raise ValueError("recovery scene contract is not finite")
         if self.tread_m <= 0.0 or self.num_steps < 1:
             raise ValueError("recovery scene needs positive stair geometry")
+        risers = np.asarray(self.riser_progress_m, dtype=np.float64)
+        if len(risers):
+            if (
+                risers.shape != (self.num_steps,)
+                or not np.isfinite(risers).all()
+                or np.any(np.diff(risers) <= 0.0)
+                or abs(float(risers[0])) > 1.0e-8
+            ):
+                raise ValueError(
+                    "recovery riser progress must be N ordered values starting at zero"
+                )
+        if self.geometry_sha256 is not None and (
+            len(self.geometry_sha256) != 64
+            or any(value not in "0123456789abcdef" for value in self.geometry_sha256)
+        ):
+            raise ValueError("recovery geometry sha256 is invalid")
+        if self.exact_command_required and self.geometry_sha256 is None:
+            raise ValueError("strict recovery needs a geometry sha256")
 
     @property
     def yaw_delta_rad(self) -> float:
@@ -97,6 +119,9 @@ class RecoverySceneContract:
             "yaw_delta_rad": self.yaw_delta_rad,
             "tread_m": self.tread_m,
             "num_steps": self.num_steps,
+            "riser_progress_m": list(self.riser_progress_m),
+            "geometry_sha256": self.geometry_sha256,
+            "exact_command_required": self.exact_command_required,
         }
 
 
@@ -288,6 +313,19 @@ def load_reference_clip(path: str | Path) -> ReferenceClip:
     count = next(iter(lengths))
     if count < HISTORY_FRAMES + MIN_REMAINING_FRAMES:
         raise RecoveryContractError(f"{source.name} is too short for recovery matching")
+    if "task12" in arrays:
+        task12 = arrays["task12"]
+        if task12.shape != (count, 12) or not np.isfinite(task12).all():
+            raise RecoveryContractError(
+                f"{source.name} task12 must be finite [T,12]"
+            )
+    for name in (
+        "reference_scene_id",
+        "reference_geometry_sha256",
+        "command_schedule_kind",
+    ):
+        if name in arrays and arrays[name].size != 1:
+            raise RecoveryContractError(f"{source.name} {name} must be scalar")
     return ReferenceClip(source, source.stem, arrays, _sha256(source))
 
 
@@ -514,8 +552,16 @@ def _terrain_stage(
     *,
     tread_m: float = S13_TREAD_M,
     num_steps: int = 3,
+    riser_progress_m: Sequence[float] = (),
 ) -> np.ndarray:
     progress = np.asarray(progress_m, dtype=np.float64)
+    risers = np.asarray(riser_progress_m, dtype=np.float64)
+    if len(risers):
+        return np.clip(
+            np.searchsorted(risers, progress, side="right"),
+            0,
+            int(num_steps),
+        ).astype(np.int64)
     return np.where(
         progress < 0.0,
         0,
@@ -592,11 +638,13 @@ def _reference_history(clip: ReferenceClip, frame: int):
 
 
 def reference_task12(clip: ReferenceClip, frame: int) -> np.ndarray:
-    """Infer the canonical four-knot Task12 from a clean reference root."""
+    """Return recorded Task12, with kinematic inference only for legacy clips."""
     frame = int(frame)
     if frame < 0 or frame >= clip.frame_count:
         raise RecoveryContractError("reference command frame is out of range")
     a = clip.arrays
+    if "task12" in a:
+        return np.asarray(a["task12"][frame], dtype=np.float32).reshape(4, 3)
     root_quat = np.asarray(
         a["body_quat_w"][:, REFERENCE_ROOT_BODY], dtype=np.float64
     )
@@ -655,12 +703,50 @@ def rank_recovery_candidates(
     )
     query_stage = int(
         _terrain_stage(
-            query_progress, tread_m=scene.tread_m, num_steps=scene.num_steps
+            query_progress,
+            tread_m=scene.tread_m,
+            num_steps=scene.num_steps,
+            riser_progress_m=scene.riser_progress_m,
         )
     )
 
     candidates: list[RecoveryCandidate] = []
     for clip in clips:
+        if scene.exact_command_required:
+            required = {
+                "task12",
+                "reference_scene_id",
+                "reference_geometry_sha256",
+                "command_schedule_kind",
+            }
+            missing = sorted(required.difference(clip.arrays))
+            if missing:
+                raise RecoveryContractError(
+                    f"strict reference {clip.name} is missing {', '.join(missing)}"
+                )
+            reference_scene_id = str(
+                np.asarray(clip.arrays["reference_scene_id"]).reshape(-1)[0]
+            )
+            reference_geometry = str(
+                np.asarray(clip.arrays["reference_geometry_sha256"]).reshape(-1)[0]
+            )
+            schedule_kind = str(
+                np.asarray(clip.arrays["command_schedule_kind"]).reshape(-1)[0]
+            )
+            if reference_scene_id != scene.scene_id:
+                raise RecoveryContractError(
+                    f"reference scene {reference_scene_id!r} does not match {scene.scene_id!r}"
+                )
+            if reference_geometry != scene.geometry_sha256:
+                raise RecoveryContractError(
+                    "reference geometry hash does not match recovery scene"
+                )
+            if schedule_kind != (
+                "canonical_kinematic_inference_from_warped_expert_reference"
+            ):
+                raise RecoveryContractError(
+                    "strict reference command schedule has unsupported provenance"
+                )
         root_position = np.asarray(
             clip.arrays["body_pos_w"][:, REFERENCE_ROOT_BODY], dtype=np.float64
         )
@@ -671,7 +757,10 @@ def rank_recovery_candidates(
             heading_yaw_rad=scene.reference_heading_yaw_rad,
         )
         stages = _terrain_stage(
-            progress, tread_m=scene.tread_m, num_steps=scene.num_steps
+            progress,
+            tread_m=scene.tread_m,
+            num_steps=scene.num_steps,
+            riser_progress_m=scene.riser_progress_m,
         )
         support = _reference_support(clip)
         clip_task12 = {
@@ -703,7 +792,10 @@ def rank_recovery_candidates(
             command_mean_yaw_rate_error = float(
                 abs(query_command_mean[2] - reference_command_mean[2])
             )
-            if (
+            if scene.exact_command_required:
+                if float(np.max(np.abs(command_delta))) > EXACT_COMMAND_MAX_ABS_ERROR:
+                    continue
+            elif (
                 command_knot_rmse > COMMAND_KNOT_RMSE_LIMIT
                 or command_mean_planar_error > COMMAND_MEAN_PLANAR_ERROR_LIMIT
                 or command_mean_yaw_rate_error > COMMAND_MEAN_YAW_RATE_ERROR_LIMIT
@@ -838,12 +930,21 @@ def build_recovery_proposal(
             "reference_clock": "matched frame minus learner-frame lag",
         },
         "command_matching": {
-            "source": "exact learner Task12 versus clean-reference inferred Task12",
+            "source": (
+                "exact learner Task12 versus reference-recorded Task12"
+                if scene.exact_command_required
+                else "exact learner Task12 versus legacy kinematic Task12 estimate"
+            ),
             "task12_offsets": TASK12_OFFSETS.tolist(),
             "command3": "[local_vx_m_s, local_vy_m_s, yaw_rate_rad_s]",
             "knot_rmse_limit": COMMAND_KNOT_RMSE_LIMIT,
             "mean_planar_error_limit": COMMAND_MEAN_PLANAR_ERROR_LIMIT,
             "mean_yaw_rate_error_limit": COMMAND_MEAN_YAW_RATE_ERROR_LIMIT,
+            "maximum_absolute_error_limit": (
+                EXACT_COMMAND_MAX_ABS_ERROR
+                if scene.exact_command_required else None
+            ),
+            "exact_equality_required": scene.exact_command_required,
             "hard_filter": True,
         },
         "matching_only": True,
@@ -857,6 +958,18 @@ def build_recovery_proposal(
                 "path": str(clip.path),
                 "sha256": clip.sha256,
                 "frames": clip.frame_count,
+                "scene_id": (
+                    str(np.asarray(clip.arrays["reference_scene_id"]).reshape(-1)[0])
+                    if "reference_scene_id" in clip.arrays else None
+                ),
+                "geometry_sha256": (
+                    str(
+                        np.asarray(
+                            clip.arrays["reference_geometry_sha256"]
+                        ).reshape(-1)[0]
+                    )
+                    if "reference_geometry_sha256" in clip.arrays else None
+                ),
             }
             for clip in clips
         ],

@@ -105,6 +105,45 @@ def _write_reference(path: Path, frames: int = 160, offset: float = 0.0) -> Path
     return path
 
 
+def _write_strict_reference(
+    path: Path,
+    *,
+    scene_id: str = "strict_scene",
+    geometry_sha256: str = "a" * 64,
+) -> Path:
+    _write_reference(path)
+    with np.load(path, allow_pickle=False) as source:
+        arrays = {name: np.asarray(source[name]) for name in source.files}
+    arrays.update(
+        task12=np.broadcast_to(
+            np.tile(np.asarray((0.5, 0.0, 0.0), np.float32), 4),
+            (160, 12),
+        ).copy(),
+        reference_scene_id=np.asarray(scene_id),
+        reference_geometry_sha256=np.asarray(geometry_sha256),
+        command_schedule_kind=np.asarray(
+            "canonical_kinematic_inference_from_warped_expert_reference"
+        ),
+    )
+    np.savez(path, **arrays)
+    return path
+
+
+def _strict_scene(geometry_sha256: str = "a" * 64) -> RecoverySceneContract:
+    return RecoverySceneContract(
+        scene_id="strict_scene",
+        learner_front_xy=(3.0, 0.0),
+        reference_front_xy=(-0.21065, -4.3529),
+        learner_heading_yaw_rad=0.0,
+        reference_heading_yaw_rad=math.pi,
+        tread_m=0.3302,
+        num_steps=3,
+        riser_progress_m=(0.0, 0.3302, 0.6604),
+        geometry_sha256=geometry_sha256,
+        exact_command_required=True,
+    )
+
+
 def test_rewind_query_uses_physics_step_and_full_history(tmp_path: Path) -> None:
     trace = load_recovery_trace(_write_trace(tmp_path / "trace.npz"))
     query = select_rewind_queries(
@@ -193,6 +232,39 @@ def test_single_synthesized_reference_is_explicitly_opt_in(tmp_path: Path) -> No
     reference = _write_reference(tmp_path / "synthesized.npz")
 
     assert load_reference_bank([reference], minimum_clips=1)[0].name == "synthesized"
+
+
+def test_strict_reference_requires_exact_recorded_task12(tmp_path: Path) -> None:
+    trace = load_recovery_trace(_write_trace(tmp_path / "trace.npz"))
+    clip = load_reference_bank(
+        [_write_strict_reference(tmp_path / "strict.npz")], minimum_clips=1
+    )[0]
+    query = select_rewind_queries(
+        trace, first_fall_physics_step=500, rewinds_s=(0.5,)
+    )[0]
+
+    candidates = rank_recovery_candidates(
+        trace, query, (clip,), scene=_strict_scene()
+    )
+
+    assert candidates
+    assert all(candidate.command_knot_rmse == 0.0 for candidate in candidates)
+    assert all(candidate.command_cost == 0.0 for candidate in candidates)
+
+
+def test_strict_reference_rejects_geometry_hash_mismatch(tmp_path: Path) -> None:
+    trace = load_recovery_trace(_write_trace(tmp_path / "trace.npz"))
+    clip = load_reference_bank(
+        [_write_strict_reference(tmp_path / "strict.npz")], minimum_clips=1
+    )[0]
+    query = select_rewind_queries(
+        trace, first_fall_physics_step=500, rewinds_s=(0.5,)
+    )[0]
+
+    with pytest.raises(RecoveryContractError, match="geometry hash"):
+        rank_recovery_candidates(
+            trace, query, (clip,), scene=_strict_scene("b" * 64)
+        )
 
 
 def test_tracker_history_is_exact_chronological_learner_history(

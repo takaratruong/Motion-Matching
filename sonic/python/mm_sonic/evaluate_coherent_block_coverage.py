@@ -514,6 +514,24 @@ def evaluate(
                     warped.motion.root_quaternion_world_wxyz
                 ),
                 joint_position=warped.motion.joint_position,
+                seam_indices=np.asarray(
+                    warped.motion.seam_indices, dtype=np.int64
+                ),
+                source_archive_clip_index=np.asarray(
+                    [
+                        value.archive_clip_index
+                        for value in warped.motion.provenance
+                    ],
+                    dtype=np.int64,
+                ),
+                source_frame=np.asarray(
+                    [value.source_frame for value in warped.motion.provenance],
+                    dtype=np.int64,
+                ),
+                source_clip_id=np.asarray(
+                    [str(value.clip_id) for value in warped.motion.provenance],
+                    dtype=np.str_,
+                ),
             )
             plan_rows.append(
                 {

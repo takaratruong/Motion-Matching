@@ -69,6 +69,11 @@ def _scene_contract(proposal: Mapping[str, object]) -> RecoverySceneContract:
         reference_heading_yaw_rad=float(payload["reference_heading_yaw_rad"]),
         tread_m=float(payload["tread_m"]),
         num_steps=int(payload["num_steps"]),
+        riser_progress_m=tuple(payload.get("riser_progress_m", ())),
+        geometry_sha256=payload.get("geometry_sha256"),
+        exact_command_required=bool(
+            payload.get("exact_command_required", False)
+        ),
     )
 
 
@@ -171,7 +176,7 @@ def render_comparison(
     *,
     proposal_path: Path,
     attempt: Path,
-    before_output: Path,
+    before_output: Path | None,
     after_output: Path,
     metadata_output: Path,
     model_path: Path = DEFAULT_MODEL_PATH,
@@ -204,12 +209,16 @@ def render_comparison(
         "camera_distance": 2.8,
         "camera_follow_root": True,
     }
-    before_render = render_stitched_motion(
-        learner,
-        output_path=before_output,
-        camera_azimuth_offset_deg=_camera_offset_for_absolute_azimuth(learner, 270.0),
-        **render_common,
-    )
+    before_render = None
+    if before_output is not None:
+        before_render = render_stitched_motion(
+            learner,
+            output_path=before_output,
+            camera_azimuth_offset_deg=_camera_offset_for_absolute_azimuth(
+                learner, 270.0
+            ),
+            **render_common,
+        )
     after_render = render_stitched_motion(
         recovered,
         output_path=after_output,
@@ -240,7 +249,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--proposal", type=Path, required=True)
     parser.add_argument("--attempt", type=Path, required=True)
-    parser.add_argument("--before-out", type=Path, required=True)
+    parser.add_argument(
+        "--before-out",
+        type=Path,
+        help="render the dense-only rollout; omit when a case baseline already exists",
+    )
     parser.add_argument("--after-out", type=Path, required=True)
     parser.add_argument("--metadata-out", type=Path, required=True)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)

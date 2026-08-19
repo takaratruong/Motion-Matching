@@ -895,6 +895,28 @@ def run(args: argparse.Namespace) -> Path:
     reference = Path(str(candidate["clip_path"])).resolve()
     if _sha256(reference) != candidate["clip_sha256"]:
         raise TrackerRecoveryError("reference clip changed after proposal generation")
+    evaluation_geometry = proposal.get("evaluation_geometry")
+    object_usd = None if args.object_usd is None else Path(args.object_usd).resolve()
+    if isinstance(evaluation_geometry, Mapping) and evaluation_geometry.get(
+        "object_usd_sha256"
+    ) is not None:
+        if object_usd is None or not object_usd.is_file():
+            raise TrackerRecoveryError(
+                "strict recovery proposal requires its pinned object USD"
+            )
+        if _sha256(object_usd) != evaluation_geometry["object_usd_sha256"]:
+            raise TrackerRecoveryError(
+                "tracker object USD does not match the recovery geometry contract"
+            )
+        scene_transform = proposal.get("scene_transform")
+        if not isinstance(scene_transform, Mapping) or (
+            scene_transform.get("scene_id") != evaluation_geometry.get("scene_id")
+            or scene_transform.get("geometry_sha256")
+            != evaluation_geometry.get("geometry_sha256")
+        ):
+            raise TrackerRecoveryError(
+                "proposal scene identity differs from evaluation geometry"
+            )
     output = Path(args.out).resolve()
     output.mkdir(parents=True, exist_ok=False)
     tracker_repo = Path(args.tracker_repo).resolve()
@@ -905,7 +927,7 @@ def run(args: argparse.Namespace) -> Path:
         tracker_repo=tracker_repo,
         reference_npz=reference,
         output=output,
-        object_usd=(None if args.object_usd is None else Path(args.object_usd)),
+        object_usd=object_usd,
     )
 
     import torch
