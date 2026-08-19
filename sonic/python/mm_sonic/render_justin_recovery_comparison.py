@@ -41,8 +41,11 @@ def _load_contract(proposal_path: Path, attempt: Path) -> tuple[dict, dict, dict
     proposal = json.loads(proposal_path.read_text())
     receipt_path = attempt / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
-    if receipt.get("handoff_mode") != "exact_learner_state_and_history":
-        raise ValueError("comparison requires an exact learner-history handoff")
+    if receipt.get("handoff_mode") not in {
+        "exact_learner_state_and_history",
+        "legacy_instantaneous_state",
+    }:
+        raise ValueError("comparison handoff mode is unsupported")
     if receipt.get("proposal_sha256") != _sha256(proposal_path):
         raise ValueError("attempt receipt does not belong to this proposal")
     query_index = int(receipt["query_index"])
@@ -222,6 +225,8 @@ def render_comparison(
         "query_index": int(receipt["query_index"]),
         "candidate_index": int(receipt["candidate_index"]),
         "rewind_s": float(receipt["rewind_s"]),
+        "handoff_mode": str(receipt["handoff_mode"]),
+        "state_injection": receipt.get("state_injection"),
         "before": before_render,
         "after": after_render,
         "handoff": seam,
