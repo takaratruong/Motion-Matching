@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import copy
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -26,12 +27,78 @@ from .justin_recovery import TRACKER_HISTORY_FRAMES
 
 TRACKER_SCREEN_STEPS = 25
 TRACKER_MPJPE_LIMIT_MM = 300.0
-STABLE_TOP_ROOT_Z_M = 1.10
 STABLE_TOP_TAIL_STEPS = 20
+JUSTIN_PLATFORM_ENTRY_X_M = -0.87105
+JUSTIN_PLATFORM_ROOT_Z_M = 1.20
+JUSTIN_PLATFORM_Y_MIN_M = -4.8529
+JUSTIN_PLATFORM_Y_MAX_M = -3.8529
 
 
 class TrackerRecoveryError(RuntimeError):
     pass
+
+
+@dataclass
+class AdaptiveReferenceClock:
+    """Binary phase controller that pauses a reference until the robot catches up."""
+
+    freeze_root_error_m: float = 0.20
+    resume_root_error_m: float = 0.12
+    frozen: bool = False
+    hold_steps: int = 0
+    terminal_hold_steps: int = 0
+    freeze_events: int = 0
+    resume_events: int = 0
+    longest_hold_steps: int = 0
+    _current_hold_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if not (
+            np.isfinite(self.freeze_root_error_m)
+            and np.isfinite(self.resume_root_error_m)
+            and 0.0 < self.resume_root_error_m < self.freeze_root_error_m
+        ):
+            raise TrackerRecoveryError(
+                "adaptive clock needs 0 < resume error < freeze error"
+            )
+
+    def should_advance(self, root_error_m: float, *, at_terminal: bool) -> bool:
+        error = float(root_error_m)
+        if not np.isfinite(error) or error < 0.0:
+            raise TrackerRecoveryError("adaptive clock root error is invalid")
+        if at_terminal:
+            advance = False
+            self.terminal_hold_steps += 1
+        else:
+            if self.frozen and error <= self.resume_root_error_m:
+                self.frozen = False
+                self.resume_events += 1
+            elif not self.frozen and error >= self.freeze_root_error_m:
+                self.frozen = True
+                self.freeze_events += 1
+            advance = not self.frozen
+        if advance:
+            self._current_hold_steps = 0
+        else:
+            self.hold_steps += 1
+            self._current_hold_steps += 1
+            self.longest_hold_steps = max(
+                self.longest_hold_steps, self._current_hold_steps
+            )
+        return advance
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "mode": "root_error_hysteresis",
+            "freeze_root_error_m": self.freeze_root_error_m,
+            "resume_root_error_m": self.resume_root_error_m,
+            "hold_steps": self.hold_steps,
+            "terminal_hold_steps": self.terminal_hold_steps,
+            "freeze_events": self.freeze_events,
+            "resume_events": self.resume_events,
+            "longest_hold_steps": self.longest_hold_steps,
+            "frozen_at_end": self.frozen,
+        }
 
 
 def _kit_cache_args(cache_path: Path) -> str:
@@ -184,35 +251,55 @@ def select_proposal_candidate(
 def evaluate_tracker_attempt(
     *,
     mpjpe_mm: np.ndarray,
-    root_z_m: np.ndarray,
+    root_position_m: np.ndarray,
     terminated_early: bool,
     screen_steps: int = TRACKER_SCREEN_STEPS,
     completed_reference: bool,
 ) -> dict[str, object]:
     mpjpe = np.asarray(mpjpe_mm, dtype=np.float64)
-    root_z = np.asarray(root_z_m, dtype=np.float64)
-    if mpjpe.ndim != 1 or root_z.shape != mpjpe.shape or len(mpjpe) == 0:
-        raise TrackerRecoveryError("tracker metrics must be equal non-empty vectors")
-    if not np.isfinite(mpjpe).all() or not np.isfinite(root_z).all():
+    root_position = np.asarray(root_position_m, dtype=np.float64)
+    if (
+        mpjpe.ndim != 1
+        or root_position.shape != (len(mpjpe), 3)
+        or len(mpjpe) == 0
+    ):
+        raise TrackerRecoveryError(
+            "tracker metrics must contain MPJPE [T] and root position [T, 3]"
+        )
+    if not np.isfinite(mpjpe).all() or not np.isfinite(root_position).all():
         raise TrackerRecoveryError("tracker metrics contain non-finite values")
     screened = len(mpjpe) >= int(screen_steps)
     screen_peak = float(mpjpe[: min(len(mpjpe), int(screen_steps))].max())
     screen_pass = bool(
         screened and not terminated_early and screen_peak <= TRACKER_MPJPE_LIMIT_MM
     )
-    tail = root_z[-min(len(root_z), STABLE_TOP_TAIL_STEPS) :]
-    stable_top = bool(
+    tail = root_position[-min(len(root_position), STABLE_TOP_TAIL_STEPS) :]
+    tail_on_platform = (
+        (tail[:, 0] <= JUSTIN_PLATFORM_ENTRY_X_M)
+        & (tail[:, 1] >= JUSTIN_PLATFORM_Y_MIN_M)
+        & (tail[:, 1] <= JUSTIN_PLATFORM_Y_MAX_M)
+        & (tail[:, 2] >= JUSTIN_PLATFORM_ROOT_Z_M)
+    )
+    reached_platform = bool(
+        np.any(
+            (root_position[:, 0] <= JUSTIN_PLATFORM_ENTRY_X_M)
+            & (root_position[:, 1] >= JUSTIN_PLATFORM_Y_MIN_M)
+            & (root_position[:, 1] <= JUSTIN_PLATFORM_Y_MAX_M)
+            & (root_position[:, 2] >= JUSTIN_PLATFORM_ROOT_Z_M)
+        )
+    )
+    stable_platform = bool(
         completed_reference
         and len(tail) == STABLE_TOP_TAIL_STEPS
-        and float(tail.min()) >= STABLE_TOP_ROOT_Z_M
-        and float(tail.std()) <= 0.08
+        and bool(tail_on_platform.all())
+        and float(tail[:, 2].std()) <= 0.08
     )
     full_pass = bool(
         screen_pass
         and completed_reference
         and not terminated_early
         and float(mpjpe.max()) <= TRACKER_MPJPE_LIMIT_MM
-        and stable_top
+        and stable_platform
     )
     return {
         "screened": screened,
@@ -223,9 +310,15 @@ def evaluate_tracker_attempt(
         "terminated_early": bool(terminated_early),
         "peak_mpjpe_mm": float(mpjpe.max()),
         "mean_mpjpe_mm": float(mpjpe.mean()),
-        "stable_top": stable_top,
-        "stable_top_tail_min_root_z_m": float(tail.min()),
-        "stable_top_tail_std_root_z_m": float(tail.std()),
+        "reached_platform": reached_platform,
+        "stable_platform": stable_platform,
+        # Retain the old keys as explicit compatibility aliases.  Their
+        # semantics are now the strict geometry-aware platform test.
+        "stable_top": stable_platform,
+        "stable_top_tail_min_root_x_m": float(tail[:, 0].min()),
+        "stable_top_tail_max_root_x_m": float(tail[:, 0].max()),
+        "stable_top_tail_min_root_z_m": float(tail[:, 2].min()),
+        "stable_top_tail_std_root_z_m": float(tail[:, 2].std()),
         "accepted_recovery": full_pass,
     }
 
@@ -702,7 +795,22 @@ def run(args: argparse.Namespace) -> Path:
 
     frame = int(candidate["frame"])
     remaining = int(candidate["frames_remaining"])
-    max_steps = min(remaining, int(args.max_steps) if args.max_steps > 0 else remaining)
+    terminal_frame = frame + remaining - 1
+    adaptive_clock = (
+        AdaptiveReferenceClock(
+            freeze_root_error_m=args.clock_freeze_root_error_m,
+            resume_root_error_m=args.clock_resume_root_error_m,
+        )
+        if args.adaptive_reference_clock
+        else None
+    )
+    rollout_budget = remaining + (
+        int(args.max_clock_hold_steps) if adaptive_clock is not None else 0
+    )
+    max_steps = min(
+        rollout_budget,
+        int(args.max_steps) if args.max_steps > 0 else rollout_budget,
+    )
     previous_done = torch.zeros(1, dtype=torch.bool, device=args.device)
     root_pos: list[np.ndarray] = []
     root_quat: list[np.ndarray] = []
@@ -710,12 +818,40 @@ def run(args: argparse.Namespace) -> Path:
     joint_vel: list[np.ndarray] = []
     mpjpe: list[float] = []
     reference_frames: list[int] = []
+    reference_held: list[bool] = []
+    root_tracking_error_m: list[float] = []
     terminated_early = False
     time_out = False
     with torch.no_grad():
         for step in range(max_steps):
+            current_frame_before = int(
+                (motion_cmd.motion_start_time_steps + motion_cmd.time_steps)[0].item()
+            )
+            phase_root_error = float(
+                (
+                    motion_cmd.body_pos_w[0, 0]
+                    - motion_cmd.robot_body_pos_w[0, 0]
+                )
+                .norm()
+                .item()
+            )
+            advance_reference = (
+                adaptive_clock.should_advance(
+                    phase_root_error,
+                    at_terminal=current_frame_before >= terminal_frame,
+                )
+                if adaptive_clock is not None
+                else True
+            )
             action = policy.action(obs, previous_done)
             obs, _reward, dones, extras = env.step({"actions": action, "obs_dict": None})
+            if not advance_reference:
+                # TrackingCommand increments its cursor inside env.step().
+                # Undo that one tick and rebuild only the current observation;
+                # update_history=False avoids duplicating proprioceptive history.
+                motion_cmd.time_steps.sub_(1)
+                raw = env.env.observation_manager.compute(update_history=False)
+                obs = env.process_raw_obs(raw, flatten_dict_obs=True)
             obs = {name: value.to(args.device) for name, value in obs.items()}
             previous_done = dones
             error = ((motion_cmd.body_pos_w - motion_cmd.robot_body_pos_w).norm(dim=-1) * 1000.0)
@@ -728,9 +864,20 @@ def run(args: argparse.Namespace) -> Path:
                 (motion_cmd.motion_start_time_steps + motion_cmd.time_steps)[0].item()
             )
             reference_frames.append(current_frame)
+            reference_held.append(not advance_reference)
+            root_tracking_error_m.append(
+                float(
+                    (
+                        motion_cmd.body_pos_w[0, 0]
+                        - motion_cmd.robot_body_pos_w[0, 0]
+                    )
+                    .norm()
+                    .item()
+                )
+            )
             if bool(dones[0].item()):
                 time_out = bool(extras.get("time_outs", torch.zeros_like(dones))[0].item())
-                terminated_early = not time_out and current_frame < frame + remaining - 1
+                terminated_early = not time_out and current_frame < terminal_frame
                 break
             if step + 1 == TRACKER_SCREEN_STEPS and max(mpjpe) > TRACKER_MPJPE_LIMIT_MM:
                 terminated_early = True
@@ -740,11 +887,11 @@ def run(args: argparse.Namespace) -> Path:
     mpjpe_a = np.asarray(mpjpe, dtype=np.float32)
     completed_reference = bool(
         len(reference_frames) > 0
-        and (reference_frames[-1] >= frame + remaining - 1 or time_out)
+        and reference_frames[-1] >= terminal_frame
     )
     evaluation = evaluate_tracker_attempt(
         mpjpe_mm=mpjpe_a,
-        root_z_m=root_pos_a[:, 2],
+        root_position_m=root_pos_a,
         terminated_early=terminated_early,
         completed_reference=completed_reference,
     )
@@ -756,10 +903,12 @@ def run(args: argparse.Namespace) -> Path:
         joint_vel=np.asarray(joint_vel, dtype=np.float32),
         mpjpe_mm=mpjpe_a,
         reference_frames=np.asarray(reference_frames, dtype=np.int64),
+        reference_held=np.asarray(reference_held, dtype=np.bool_),
+        root_tracking_error_m=np.asarray(root_tracking_error_m, dtype=np.float32),
         fps=np.asarray([50], dtype=np.int64),
     )
     receipt = {
-        "schema": "justin-s13-tracker-recovery-attempt/v3",
+        "schema": "justin-s13-tracker-recovery-attempt/v4",
         "proposal": str(proposal_path),
         "proposal_sha256": _sha256(proposal_path),
         "query_index": int(args.query_index),
@@ -797,6 +946,13 @@ def run(args: argparse.Namespace) -> Path:
         },
         "fine_tuning_performed": False,
         "rollout_steps": len(mpjpe),
+        "reference_clock": (
+            adaptive_clock.receipt()
+            if adaptive_clock is not None
+            else {"mode": "fixed_rate", "hold_steps": 0}
+        ),
+        "reference_terminal_frame": terminal_frame,
+        "reference_final_frame": reference_frames[-1] if reference_frames else None,
         "evaluation": evaluation,
     }
     (output / "receipt.json").write_text(
@@ -837,8 +993,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "ten-frame learner observation/action history"
         ),
     )
+    parser.add_argument(
+        "--adaptive-reference-clock",
+        action="store_true",
+        help=(
+            "pause the matched reference when root tracking error exceeds the "
+            "freeze threshold and resume after the robot catches up"
+        ),
+    )
+    parser.add_argument("--clock-freeze-root-error-m", type=float, default=0.20)
+    parser.add_argument("--clock-resume-root-error-m", type=float, default=0.12)
+    parser.add_argument("--max-clock-hold-steps", type=int, default=200)
     parser.add_argument("--kit-cache", required=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.max_clock_hold_steps < 0:
+        parser.error("--max-clock-hold-steps must be non-negative")
+    if args.adaptive_reference_clock:
+        try:
+            AdaptiveReferenceClock(
+                freeze_root_error_m=args.clock_freeze_root_error_m,
+                resume_root_error_m=args.clock_resume_root_error_m,
+            )
+        except TrackerRecoveryError as error:
+            parser.error(str(error))
+    return args
 
 
 def main() -> None:

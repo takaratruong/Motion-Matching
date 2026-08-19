@@ -5,6 +5,7 @@ import pytest
 from types import SimpleNamespace
 
 from mm_sonic.justin_tracker_recovery import (
+    AdaptiveReferenceClock,
     TrackerRecoveryError,
     _compatible_urdf_extension_name,
     _disable_builtin_failure_terminations,
@@ -159,34 +160,91 @@ def test_quaternion_blend_uses_shortest_arc() -> None:
 
 
 def test_tracker_acceptance_requires_screen_completion_and_stable_top() -> None:
+    platform_root = np.tile(np.asarray((-1.0, -4.3, 1.3)), (60, 1))
     accepted = evaluate_tracker_attempt(
         mpjpe_mm=np.full(60, 120.0),
-        root_z_m=np.full(60, 1.3),
+        root_position_m=platform_root,
         terminated_early=False,
         completed_reference=True,
     )
     assert accepted["screen_pass"] is True
+    assert accepted["reached_platform"] is True
+    assert accepted["stable_platform"] is True
     assert accepted["stable_top"] is True
     assert accepted["accepted_recovery"] is True
 
 
 @pytest.mark.parametrize(
-    ("mpjpe", "root_z", "terminated", "completed", "failed_gate"),
+    ("mpjpe", "root", "terminated", "completed", "failed_gate"),
     [
-        (np.full(60, 301.0), np.full(60, 1.3), False, True, "screen_pass"),
-        (np.full(60, 120.0), np.full(60, 1.0), False, True, "stable_top"),
-        (np.full(60, 120.0), np.full(60, 1.3), True, True, "screen_pass"),
-        (np.full(60, 120.0), np.full(60, 1.3), False, False, "stable_top"),
+        (
+            np.full(60, 301.0),
+            np.tile((-1.0, -4.3, 1.3), (60, 1)),
+            False,
+            True,
+            "screen_pass",
+        ),
+        (
+            np.full(60, 120.0),
+            np.tile((-0.7, -4.3, 1.14), (60, 1)),
+            False,
+            True,
+            "reached_platform",
+        ),
+        (
+            np.full(60, 120.0),
+            np.tile((-1.0, -4.3, 1.3), (60, 1)),
+            True,
+            True,
+            "screen_pass",
+        ),
+        (
+            np.full(60, 120.0),
+            np.tile((-1.0, -4.3, 1.3), (60, 1)),
+            False,
+            False,
+            "stable_top",
+        ),
     ],
 )
 def test_tracker_acceptance_rejects_each_failure_gate(
-    mpjpe, root_z, terminated, completed, failed_gate
+    mpjpe, root, terminated, completed, failed_gate
 ) -> None:
     result = evaluate_tracker_attempt(
         mpjpe_mm=mpjpe,
-        root_z_m=root_z,
+        root_position_m=root,
         terminated_early=terminated,
         completed_reference=completed,
     )
     assert result[failed_gate] is False
     assert result["accepted_recovery"] is False
+
+
+def test_adaptive_reference_clock_freezes_resumes_and_holds_terminal() -> None:
+    clock = AdaptiveReferenceClock(
+        freeze_root_error_m=0.20, resume_root_error_m=0.12
+    )
+    assert clock.should_advance(0.10, at_terminal=False) is True
+    assert clock.should_advance(0.21, at_terminal=False) is False
+    assert clock.should_advance(0.15, at_terminal=False) is False
+    assert clock.should_advance(0.11, at_terminal=False) is True
+    assert clock.should_advance(0.05, at_terminal=True) is False
+    receipt = clock.receipt()
+    assert receipt["freeze_events"] == 1
+    assert receipt["resume_events"] == 1
+    assert receipt["hold_steps"] == 3
+    assert receipt["terminal_hold_steps"] == 1
+    assert receipt["longest_hold_steps"] == 2
+
+
+@pytest.mark.parametrize(
+    ("freeze", "resume"),
+    [(0.1, 0.1), (0.1, 0.2), (np.inf, 0.1), (0.2, 0.0)],
+)
+def test_adaptive_reference_clock_rejects_invalid_thresholds(
+    freeze: float, resume: float
+) -> None:
+    with pytest.raises(TrackerRecoveryError, match="resume error < freeze error"):
+        AdaptiveReferenceClock(
+            freeze_root_error_m=freeze, resume_root_error_m=resume
+        )
