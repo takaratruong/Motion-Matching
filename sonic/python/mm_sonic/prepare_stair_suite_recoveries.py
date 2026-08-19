@@ -26,7 +26,7 @@ from .justin_recovery import (
 from .select_command_compatible_stair_expert import select as select_expert
 
 
-REWINDS_S = tuple(np.arange(0.25, 5.01, 0.25).tolist())
+REWINDS_S = tuple(np.arange(0.02, 5.001, 0.02).tolist())
 
 
 def _scene_contract(path: Path) -> tuple[dict[str, object], RecoverySceneContract]:
@@ -71,6 +71,7 @@ def prepare(
     model_path: Path,
     proposal_dirname: str = "proposals",
     summary_name: str = "preparation_summary.json",
+    preserve_existing: bool = False,
 ) -> dict[str, object]:
     root = suite_root.expanduser().resolve()
     baseline = baseline_root.expanduser().resolve()
@@ -96,21 +97,26 @@ def prepare(
             row["rejection"] = "no exact-audited expert route"
             scene_rows.append(row)
             continue
-        selection = select_expert(
-            route_dir=scene_root / "route",
-            contract_path=contract_path,
-            target_forward_speed_mps=0.55,
-        )
+        selection_path = scene_root / "route" / "command_selection.json"
+        reference_path = scene_root / "expert_reference.npz"
+        if preserve_existing and reference_path.is_file() and selection_path.is_file():
+            selection = json.loads(selection_path.read_text())
+        else:
+            selection = select_expert(
+                route_dir=scene_root / "route",
+                contract_path=contract_path,
+                target_forward_speed_mps=0.55,
+            )
         motion_path = Path(
             str(selection["selected"]["recovery_motion_path"])
         ).resolve()
-        reference_path = scene_root / "expert_reference.npz"
-        build_reference(
-            motion_path,
-            reference_path,
-            model_path=model_path,
-            scene_contract_path=contract_path,
-        )
+        if not (preserve_existing and reference_path.is_file()):
+            build_reference(
+                motion_path,
+                reference_path,
+                model_path=model_path,
+                scene_contract_path=contract_path,
+            )
         reference = load_reference_clip(reference_path)
         row["reference"] = {
             "path": str(reference.path),
@@ -134,6 +140,21 @@ def prepare(
                 row["cases"].append(case_row)
                 continue
             trace = load_recovery_trace(trace_path)
+            proposal_path = scene_root / proposal_dirname / f"{case_id}.json"
+            if preserve_existing and proposal_path.is_file():
+                existing = json.loads(proposal_path.read_text())
+                surviving = [
+                    value for value in existing["queries"] if value["candidates"]
+                ]
+                case_row.update(
+                    status="strict_match_ready",
+                    proposal=str(proposal_path.resolve()),
+                    matching_rewinds=len(surviving),
+                    best_command_max_abs_error=0.0,
+                    preserved_existing_proposal=True,
+                )
+                row["cases"].append(case_row)
+                continue
             formal_fall = metrics.get("first_fall_step")
             failure_step = (
                 int(formal_fall)
@@ -166,7 +187,6 @@ def prepare(
                     "motion": str(motion_path),
                     "dense_policy_fallback_used": False,
                 }
-                proposal_path = scene_root / proposal_dirname / f"{case_id}.json"
                 write_recovery_proposal(proposal, proposal_path)
                 surviving = [
                     value for value in proposal["queries"] if value["candidates"]
@@ -228,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", type=Path, default=DEFAULT_G1_MJCF)
     parser.add_argument("--proposal-dirname", default="proposals")
     parser.add_argument("--summary-name", default="preparation_summary.json")
+    parser.add_argument("--preserve-existing", action="store_true")
     arguments = parser.parse_args(argv)
     result = prepare(
         suite_root=arguments.suite_root,
@@ -235,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         model_path=arguments.model,
         proposal_dirname=arguments.proposal_dirname,
         summary_name=arguments.summary_name,
+        preserve_existing=arguments.preserve_existing,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

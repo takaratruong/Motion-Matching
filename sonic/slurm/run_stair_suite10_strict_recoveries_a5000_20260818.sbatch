@@ -46,6 +46,10 @@ case "$MODE_INDEX" in
   2) MODE=blend50; BLEND=0.50; MODE_ARGS=() ;;
 esac
 OUTPUT=$ROOT/recovery_attempts/${SCENE_ID}/${CASE_ID}_${MODE}
+if [[ -s "$OUTPUT/receipt.json" && -s "$OUTPUT/tracker_rollout.npz" ]]; then
+  echo "Skipping completed attempt $OUTPUT"
+  exit 0
+fi
 [[ ! -e "$OUTPUT" && -s "$OBJECT_USD" && -x "$PYTHON" ]]
 
 export OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y PYTHONUNBUFFERED=1
