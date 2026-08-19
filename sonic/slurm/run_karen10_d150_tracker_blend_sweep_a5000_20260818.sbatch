@@ -19,12 +19,13 @@ REPO=/move/u/bodow/Projects/Motion-Matching-justin-recovery-test
 TRACKER=/move/u/justingu/Projects/grail-stairs
 PYTHON=/move/u/justingu/miniconda3/envs/env_isaaclab/bin/python
 ROOT=/move/u/bodow/outputs/justin_recovery_test/dense_epoch2_state41/karen10_tracker_reference
-PROPOSAL=$ROOT/karen10_d150_seed1_successref_proposal.json
+PROPOSAL=${PROPOSAL:-$ROOT/karen10_d150_seed1_successref_proposal.json}
 USD=$ROOT/karen10_rigid.usda
+OUTPUT_PREFIX=${OUTPUT_PREFIX:-attempt_d150_seed1_successref_blend}
 BLENDS=(0.25 0.50 0.75 1.00)
 BLEND=${BLENDS[$SLURM_ARRAY_TASK_ID]}
 LABEL=${BLEND/./p}
-OUTPUT=$ROOT/attempt_d150_seed1_successref_blend_${LABEL}
+OUTPUT=$ROOT/${OUTPUT_PREFIX}_${LABEL}
 
 QUERY=$(jq -er '[.queries | to_entries[] | select(.value.candidates | length > 0)][0].key' "$PROPOSAL")
 [[ ! -e "$OUTPUT" && -s "$USD" && -x "$PYTHON" ]]
