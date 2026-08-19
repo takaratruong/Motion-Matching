@@ -32,6 +32,9 @@ JUSTIN_PLATFORM_ENTRY_X_M = -0.87105
 JUSTIN_PLATFORM_ROOT_Z_M = 1.20
 JUSTIN_PLATFORM_Y_MIN_M = -4.8529
 JUSTIN_PLATFORM_Y_MAX_M = -3.8529
+JUSTIN_SECOND_STEP_X_MIN_M = -0.87105
+JUSTIN_SECOND_STEP_X_MAX_M = -0.54085
+JUSTIN_SECOND_STEP_ROOT_Z_M = 1.08
 
 
 class TrackerRecoveryError(RuntimeError):
@@ -115,6 +118,84 @@ class AdaptiveReferenceClock:
             "longest_hold_steps": self.longest_hold_steps,
             "frozen_at_end": self.frozen,
         }
+
+
+@dataclass
+class SecondStageRematchTrigger:
+    """Fire once after the robot is stably established on Justin's second step."""
+
+    stable_steps: int = 5
+    consecutive_steps: int = 0
+    triggered: bool = False
+
+    def __post_init__(self) -> None:
+        if self.stable_steps < 1:
+            raise TrackerRecoveryError(
+                "second-stage rematch needs a positive stable-step count"
+            )
+
+    def observe(self, root_position_m: np.ndarray) -> bool:
+        root = np.asarray(root_position_m, dtype=np.float64)
+        if root.shape != (3,) or not np.isfinite(root).all():
+            raise TrackerRecoveryError("second-stage rematch root position is invalid")
+        on_second_step = bool(
+            JUSTIN_SECOND_STEP_X_MIN_M <= root[0] <= JUSTIN_SECOND_STEP_X_MAX_M
+            and JUSTIN_PLATFORM_Y_MIN_M <= root[1] <= JUSTIN_PLATFORM_Y_MAX_M
+            and root[2] >= JUSTIN_SECOND_STEP_ROOT_Z_M
+        )
+        self.consecutive_steps = self.consecutive_steps + 1 if on_second_step else 0
+        if not self.triggered and self.consecutive_steps >= self.stable_steps:
+            self.triggered = True
+            return True
+        return False
+
+
+def select_second_stage_reference_frame(
+    *,
+    robot_root_position_m: np.ndarray,
+    robot_joint_position_rad: np.ndarray,
+    candidate_frames: np.ndarray,
+    reference_root_position_m: np.ndarray,
+    reference_joint_position_rad: np.ndarray,
+    joint_weight_m_per_rad: float,
+) -> dict[str, float | int]:
+    """Select a moving step-two reference pose using root and joint proximity."""
+
+    robot_root = np.asarray(robot_root_position_m, dtype=np.float64)
+    robot_joint = np.asarray(robot_joint_position_rad, dtype=np.float64)
+    frames = np.asarray(candidate_frames, dtype=np.int64)
+    reference_root = np.asarray(reference_root_position_m, dtype=np.float64)
+    reference_joint = np.asarray(reference_joint_position_rad, dtype=np.float64)
+    if robot_root.shape != (3,) or robot_joint.ndim != 1:
+        raise TrackerRecoveryError("second-stage robot state has invalid shapes")
+    if (
+        frames.ndim != 1
+        or len(frames) == 0
+        or reference_root.shape != (len(frames), 3)
+        or reference_joint.shape != (len(frames), len(robot_joint))
+    ):
+        raise TrackerRecoveryError("second-stage reference search has invalid shapes")
+    if (
+        not np.isfinite(robot_root).all()
+        or not np.isfinite(robot_joint).all()
+        or not np.isfinite(reference_root).all()
+        or not np.isfinite(reference_joint).all()
+        or not np.isfinite(joint_weight_m_per_rad)
+        or joint_weight_m_per_rad < 0.0
+    ):
+        raise TrackerRecoveryError("second-stage reference search contains invalid values")
+    root_error = np.linalg.norm(reference_root - robot_root[None, :], axis=1)
+    joint_rmse = np.sqrt(
+        np.mean((reference_joint - robot_joint[None, :]) ** 2, axis=1)
+    )
+    score = root_error + float(joint_weight_m_per_rad) * joint_rmse
+    index = int(np.argmin(score))
+    return {
+        "frame": int(frames[index]),
+        "score_m": float(score[index]),
+        "root_position_error_m": float(root_error[index]),
+        "joint_position_rmse_rad": float(joint_rmse[index]),
+    }
 
 
 def _kit_cache_args(cache_path: Path) -> str:
@@ -821,8 +902,22 @@ def run(args: argparse.Namespace) -> Path:
         if args.adaptive_reference_clock
         else None
     )
+    second_stage_trigger = (
+        SecondStageRematchTrigger(stable_steps=args.second_stage_stable_steps)
+        if args.second_stage_rematch
+        else None
+    )
+    if (
+        second_stage_trigger is not None
+        and args.second_stage_reference_end_frame >= terminal_frame
+    ):
+        raise TrackerRecoveryError(
+            "second-stage reference search must end before the terminal frame"
+        )
     rollout_budget = remaining + (
         int(args.max_clock_hold_steps) if adaptive_clock is not None else 0
+    ) + (
+        int(args.second_stage_extra_steps) if second_stage_trigger is not None else 0
     )
     max_steps = min(
         rollout_budget,
@@ -836,11 +931,75 @@ def run(args: argparse.Namespace) -> Path:
     mpjpe: list[float] = []
     reference_frames: list[int] = []
     reference_held: list[bool] = []
+    reference_rematched: list[bool] = []
     root_tracking_error_m: list[float] = []
+    second_stage_rematch_receipt: dict[str, object] | None = None
+    second_stage_terminal_hold_steps = 0
     terminated_early = False
     time_out = False
     with torch.no_grad():
         for step in range(max_steps):
+            rematched_this_step = False
+            robot_root_before = motion_cmd.robot_body_pos_w[0, 0]
+            if (
+                second_stage_trigger is not None
+                and second_stage_rematch_receipt is None
+                and second_stage_trigger.observe(robot_root_before.detach().cpu().numpy())
+            ):
+                pre_rematch_frame = int(
+                    (
+                        motion_cmd.motion_start_time_steps + motion_cmd.time_steps
+                    )[0].item()
+                )
+                candidate_frames_t = torch.arange(
+                    args.second_stage_reference_start_frame,
+                    args.second_stage_reference_end_frame + 1,
+                    dtype=torch.long,
+                    device=args.device,
+                )
+                candidate_motion_ids = motion_cmd.motion_ids[0].expand_as(
+                    candidate_frames_t
+                )
+                reference_root = motion_cmd.motion_lib.get_root_pos_w(
+                    candidate_motion_ids, candidate_frames_t
+                ) + env.env.scene.env_origins[0]
+                reference_joint = motion_cmd.motion_lib.get_dof_pos(
+                    candidate_motion_ids, candidate_frames_t
+                )
+                match = select_second_stage_reference_frame(
+                    robot_root_position_m=robot_root_before.detach().cpu().numpy(),
+                    robot_joint_position_rad=robot.data.joint_pos[0]
+                    .detach()
+                    .cpu()
+                    .numpy(),
+                    candidate_frames=candidate_frames_t.detach().cpu().numpy(),
+                    reference_root_position_m=reference_root.detach().cpu().numpy(),
+                    reference_joint_position_rad=reference_joint.detach().cpu().numpy(),
+                    joint_weight_m_per_rad=args.second_stage_joint_weight_m_per_rad,
+                )
+                selected_frame = int(match["frame"])
+                if selected_frame >= pre_rematch_frame:
+                    raise TrackerRecoveryError(
+                        "second-stage rematch did not move back to a moving reference"
+                    )
+                motion_cmd.motion_start_time_steps.fill_(selected_frame)
+                motion_cmd.time_steps.zero_()
+                raw = env.env.observation_manager.compute(update_history=False)
+                obs = env.process_raw_obs(raw, flatten_dict_obs=True)
+                obs = {name: value.to(args.device) for name, value in obs.items()}
+                second_stage_rematch_receipt = {
+                    "rollout_step": step,
+                    "stable_steps": second_stage_trigger.stable_steps,
+                    "pre_rematch_reference_frame": pre_rematch_frame,
+                    "selected_reference_frame": selected_frame,
+                    "rewound_reference_frames": pre_rematch_frame - selected_frame,
+                    "search_start_frame": args.second_stage_reference_start_frame,
+                    "search_end_frame": args.second_stage_reference_end_frame,
+                    "joint_weight_m_per_rad": args.second_stage_joint_weight_m_per_rad,
+                    "robot_root_position_m": robot_root_before.detach().cpu().tolist(),
+                    **match,
+                }
+                rematched_this_step = True
             current_frame_before = int(
                 (motion_cmd.motion_start_time_steps + motion_cmd.time_steps)[0].item()
             )
@@ -852,14 +1011,19 @@ def run(args: argparse.Namespace) -> Path:
                 .norm()
                 .item()
             )
-            advance_reference = (
-                adaptive_clock.should_advance(
+            if (
+                second_stage_trigger is not None
+                and current_frame_before >= terminal_frame
+            ):
+                advance_reference = False
+                second_stage_terminal_hold_steps += 1
+            elif adaptive_clock is not None:
+                advance_reference = adaptive_clock.should_advance(
                     phase_root_error,
                     at_terminal=current_frame_before >= terminal_frame,
                 )
-                if adaptive_clock is not None
-                else True
-            )
+            else:
+                advance_reference = True
             action = policy.action(obs, previous_done)
             obs, _reward, dones, extras = env.step({"actions": action, "obs_dict": None})
             if not advance_reference:
@@ -882,6 +1046,7 @@ def run(args: argparse.Namespace) -> Path:
             )
             reference_frames.append(current_frame)
             reference_held.append(not advance_reference)
+            reference_rematched.append(rematched_this_step)
             root_tracking_error_m.append(
                 float(
                     (
@@ -921,11 +1086,12 @@ def run(args: argparse.Namespace) -> Path:
         mpjpe_mm=mpjpe_a,
         reference_frames=np.asarray(reference_frames, dtype=np.int64),
         reference_held=np.asarray(reference_held, dtype=np.bool_),
+        reference_rematched=np.asarray(reference_rematched, dtype=np.bool_),
         root_tracking_error_m=np.asarray(root_tracking_error_m, dtype=np.float32),
         fps=np.asarray([50], dtype=np.int64),
     )
     receipt = {
-        "schema": "justin-s13-tracker-recovery-attempt/v4",
+        "schema": "justin-s13-tracker-recovery-attempt/v5",
         "proposal": str(proposal_path),
         "proposal_sha256": _sha256(proposal_path),
         "query_index": int(args.query_index),
@@ -966,8 +1132,17 @@ def run(args: argparse.Namespace) -> Path:
         "reference_clock": (
             adaptive_clock.receipt()
             if adaptive_clock is not None
-            else {"mode": "fixed_rate", "hold_steps": 0}
+            else {
+                "mode": (
+                    "second_stage_rematch_with_terminal_hold"
+                    if second_stage_trigger is not None
+                    else "fixed_rate"
+                ),
+                "hold_steps": second_stage_terminal_hold_steps,
+                "terminal_hold_steps": second_stage_terminal_hold_steps,
+            }
         ),
+        "second_stage_rematch": second_stage_rematch_receipt,
         "reference_terminal_frame": terminal_frame,
         "reference_final_frame": reference_frames[-1] if reference_frames else None,
         "evaluation": evaluation,
@@ -1027,12 +1202,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="force one reference advance after this many consecutive holds",
     )
     parser.add_argument("--max-clock-hold-steps", type=int, default=200)
+    parser.add_argument(
+        "--second-stage-rematch",
+        action="store_true",
+        help=(
+            "after the robot settles on Justin's second step, rewind once to "
+            "the closest moving reference pose before the platform transition"
+        ),
+    )
+    parser.add_argument("--second-stage-stable-steps", type=int, default=5)
+    parser.add_argument("--second-stage-reference-start-frame", type=int, default=230)
+    parser.add_argument("--second-stage-reference-end-frame", type=int, default=270)
+    parser.add_argument(
+        "--second-stage-joint-weight-m-per-rad", type=float, default=0.10
+    )
+    parser.add_argument("--second-stage-extra-steps", type=int, default=150)
     parser.add_argument("--kit-cache", required=True)
     args = parser.parse_args(argv)
     if args.max_clock_hold_steps < 0:
         parser.error("--max-clock-hold-steps must be non-negative")
     if args.max_consecutive_clock_hold_steps < 1:
         parser.error("--max-consecutive-clock-hold-steps must be positive")
+    if args.adaptive_reference_clock and args.second_stage_rematch:
+        parser.error(
+            "--adaptive-reference-clock and --second-stage-rematch are separate experiments"
+        )
+    if args.second_stage_stable_steps < 1:
+        parser.error("--second-stage-stable-steps must be positive")
+    if (
+        args.second_stage_reference_start_frame < 0
+        or args.second_stage_reference_end_frame
+        < args.second_stage_reference_start_frame
+    ):
+        parser.error("second-stage reference frame range is invalid")
+    if (
+        not np.isfinite(args.second_stage_joint_weight_m_per_rad)
+        or args.second_stage_joint_weight_m_per_rad < 0.0
+    ):
+        parser.error(
+            "--second-stage-joint-weight-m-per-rad must be finite and non-negative"
+        )
+    if args.second_stage_extra_steps < 1:
+        parser.error("--second-stage-extra-steps must be positive")
     if args.adaptive_reference_clock:
         try:
             AdaptiveReferenceClock(

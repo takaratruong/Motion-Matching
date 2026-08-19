@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from mm_sonic.justin_tracker_recovery import (
     AdaptiveReferenceClock,
+    SecondStageRematchTrigger,
     TrackerRecoveryError,
     _compatible_urdf_extension_name,
     _disable_builtin_failure_terminations,
@@ -13,6 +14,7 @@ from mm_sonic.justin_tracker_recovery import (
     _slerp_wxyz,
     evaluate_tracker_attempt,
     select_proposal_candidate,
+    select_second_stage_reference_frame,
     validate_exact_learner_history,
     validate_reference_blend,
 )
@@ -256,4 +258,46 @@ def test_adaptive_reference_clock_rejects_invalid_thresholds(
     with pytest.raises(TrackerRecoveryError, match="resume error < freeze error"):
         AdaptiveReferenceClock(
             freeze_root_error_m=freeze, resume_root_error_m=resume
+        )
+
+
+def test_second_stage_rematch_requires_consecutive_step_two_observations() -> None:
+    trigger = SecondStageRematchTrigger(stable_steps=3)
+    on_step = np.asarray((-0.65, -4.30, 1.12))
+    off_step = np.asarray((-0.50, -4.30, 1.12))
+    assert trigger.observe(on_step) is False
+    assert trigger.observe(on_step) is False
+    assert trigger.observe(off_step) is False
+    assert trigger.observe(on_step) is False
+    assert trigger.observe(on_step) is False
+    assert trigger.observe(on_step) is True
+    assert trigger.observe(on_step) is False
+
+
+def test_second_stage_reference_match_balances_root_and_joint_pose() -> None:
+    match = select_second_stage_reference_frame(
+        robot_root_position_m=np.asarray((-0.60, -4.30, 1.10)),
+        robot_joint_position_rad=np.zeros(4),
+        candidate_frames=np.asarray((230, 240)),
+        reference_root_position_m=np.asarray(
+            ((-0.60, -4.30, 1.10), (-0.65, -4.30, 1.10))
+        ),
+        reference_joint_position_rad=np.asarray(((1.0,) * 4, (0.0,) * 4)),
+        joint_weight_m_per_rad=0.10,
+    )
+    assert match["frame"] == 240
+    assert match["root_position_error_m"] == pytest.approx(0.05)
+    assert match["joint_position_rmse_rad"] == pytest.approx(0.0)
+    assert match["score_m"] == pytest.approx(0.05)
+
+
+def test_second_stage_reference_match_rejects_shape_drift() -> None:
+    with pytest.raises(TrackerRecoveryError, match="invalid shapes"):
+        select_second_stage_reference_frame(
+            robot_root_position_m=np.zeros(3),
+            robot_joint_position_rad=np.zeros(4),
+            candidate_frames=np.asarray((230, 240)),
+            reference_root_position_m=np.zeros((2, 3)),
+            reference_joint_position_rad=np.zeros((2, 3)),
+            joint_weight_m_per_rad=0.10,
         )
