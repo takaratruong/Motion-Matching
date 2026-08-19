@@ -420,6 +420,33 @@ def evaluate_tracker_attempt(
     }
 
 
+def evaluate_second_stage_recovery(
+    *,
+    mpjpe_mm: np.ndarray,
+    root_position_m: np.ndarray,
+    rematch_step: int,
+    terminated_early: bool,
+    completed_reference: bool,
+) -> dict[str, object]:
+    """Evaluate only the recovery suffix produced by a second-stage rematch."""
+
+    mpjpe = np.asarray(mpjpe_mm)
+    root_position = np.asarray(root_position_m)
+    start = int(rematch_step)
+    if start < 0 or start >= len(mpjpe):
+        raise TrackerRecoveryError("second-stage evaluation rematch step is invalid")
+    result = evaluate_tracker_attempt(
+        mpjpe_mm=mpjpe[start:],
+        root_position_m=root_position[start:],
+        terminated_early=terminated_early,
+        completed_reference=completed_reference,
+    )
+    result["rematch_step"] = start
+    result["suffix_steps"] = len(mpjpe) - start
+    result["accepted_second_stage_recovery"] = result["accepted_recovery"]
+    return result
+
+
 def _build_single_clip_bundle(
     *, tracker_repo: Path, reference_npz: Path, output: Path
 ) -> tuple[Path, Path, str]:
@@ -1077,6 +1104,17 @@ def run(args: argparse.Namespace) -> Path:
         terminated_early=terminated_early,
         completed_reference=completed_reference,
     )
+    second_stage_evaluation = (
+        evaluate_second_stage_recovery(
+            mpjpe_mm=mpjpe_a,
+            root_position_m=root_pos_a,
+            rematch_step=int(second_stage_rematch_receipt["rollout_step"]),
+            terminated_early=terminated_early,
+            completed_reference=completed_reference,
+        )
+        if second_stage_rematch_receipt is not None
+        else None
+    )
     np.savez(
         output / "tracker_rollout.npz",
         root_pos=root_pos_a,
@@ -1143,6 +1181,7 @@ def run(args: argparse.Namespace) -> Path:
             }
         ),
         "second_stage_rematch": second_stage_rematch_receipt,
+        "second_stage_evaluation": second_stage_evaluation,
         "reference_terminal_frame": terminal_frame,
         "reference_final_frame": reference_frames[-1] if reference_frames else None,
         "evaluation": evaluation,
@@ -1150,7 +1189,12 @@ def run(args: argparse.Namespace) -> Path:
     (output / "receipt.json").write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n"
     )
-    print(json.dumps(evaluation, indent=2, sort_keys=True), flush=True)
+    printed_evaluation = (
+        {"overall": evaluation, "second_stage": second_stage_evaluation}
+        if second_stage_evaluation is not None
+        else evaluation
+    )
+    print(json.dumps(printed_evaluation, indent=2, sort_keys=True), flush=True)
     return output
 
 

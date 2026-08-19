@@ -12,6 +12,7 @@ from mm_sonic.justin_tracker_recovery import (
     _disable_builtin_failure_terminations,
     _kit_cache_args,
     _slerp_wxyz,
+    evaluate_second_stage_recovery,
     evaluate_tracker_attempt,
     select_proposal_candidate,
     select_second_stage_reference_frame,
@@ -220,6 +221,21 @@ def test_tracker_acceptance_rejects_each_failure_gate(
     )
     assert result[failed_gate] is False
     assert result["accepted_recovery"] is False
+
+
+def test_second_stage_evaluation_ignores_pre_rematch_tracking_spike() -> None:
+    root = np.tile(np.asarray((-1.0, -4.3, 1.3)), (60, 1))
+    result = evaluate_second_stage_recovery(
+        mpjpe_mm=np.concatenate((np.full(10, 405.0), np.full(50, 74.0))),
+        root_position_m=root,
+        rematch_step=10,
+        terminated_early=False,
+        completed_reference=True,
+    )
+    assert result["rematch_step"] == 10
+    assert result["suffix_steps"] == 50
+    assert result["peak_mpjpe_mm"] == pytest.approx(74.0)
+    assert result["accepted_second_stage_recovery"] is True
 
 
 def test_adaptive_reference_clock_freezes_resumes_and_holds_terminal() -> None:
