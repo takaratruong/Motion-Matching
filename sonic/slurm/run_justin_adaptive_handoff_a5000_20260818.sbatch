@@ -17,6 +17,10 @@
 
 set -euo pipefail
 : "${TASK_FILE:?export TASK_FILE with one tab-separated task per array index}"
+: "${CLOCK_FREEZE_ROOT_ERROR_M:=0.20}"
+: "${CLOCK_RESUME_ROOT_ERROR_M:=0.12}"
+: "${MAX_CONSECUTIVE_CLOCK_HOLD_STEPS:=1}"
+: "${MAX_CLOCK_HOLD_STEPS:=300}"
 
 REPO=/move/u/bodow/Projects/Motion-Matching-justin-recovery-test
 TRACKER=/move/u/justingu/Projects/grail-stairs
@@ -50,7 +54,8 @@ exec "$PYTHON" -u -m mm_sonic.justin_tracker_recovery \
   --device cuda:0 --seed "$seed" --episode-length-s 14 \
   --reference-blend 0 --exact-learner-handoff \
   --adaptive-reference-clock \
-  --clock-freeze-root-error-m 0.20 \
-  --clock-resume-root-error-m 0.12 \
-  --max-clock-hold-steps 300 \
+  --clock-freeze-root-error-m "$CLOCK_FREEZE_ROOT_ERROR_M" \
+  --clock-resume-root-error-m "$CLOCK_RESUME_ROOT_ERROR_M" \
+  --max-consecutive-clock-hold-steps "$MAX_CONSECUTIVE_CLOCK_HOLD_STEPS" \
+  --max-clock-hold-steps "$MAX_CLOCK_HOLD_STEPS" \
   --kit-cache "$kit_cache"

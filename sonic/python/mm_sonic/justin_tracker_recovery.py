@@ -40,15 +40,17 @@ class TrackerRecoveryError(RuntimeError):
 
 @dataclass
 class AdaptiveReferenceClock:
-    """Binary phase controller that pauses a reference until the robot catches up."""
+    """Slow a reference when the robot lags without trapping it on one pose."""
 
     freeze_root_error_m: float = 0.20
     resume_root_error_m: float = 0.12
+    max_consecutive_hold_steps: int = 1
     frozen: bool = False
     hold_steps: int = 0
     terminal_hold_steps: int = 0
     freeze_events: int = 0
     resume_events: int = 0
+    forced_advance_steps: int = 0
     longest_hold_steps: int = 0
     _current_hold_steps: int = 0
 
@@ -60,6 +62,10 @@ class AdaptiveReferenceClock:
         ):
             raise TrackerRecoveryError(
                 "adaptive clock needs 0 < resume error < freeze error"
+            )
+        if self.max_consecutive_hold_steps < 1:
+            raise TrackerRecoveryError(
+                "adaptive clock needs at least one consecutive hold step"
             )
 
     def should_advance(self, root_error_m: float, *, at_terminal: bool) -> bool:
@@ -76,7 +82,15 @@ class AdaptiveReferenceClock:
             elif not self.frozen and error >= self.freeze_root_error_m:
                 self.frozen = True
                 self.freeze_events += 1
-            advance = not self.frozen
+            if self.frozen and (
+                self._current_hold_steps >= self.max_consecutive_hold_steps
+            ):
+                # A tracker policy expects a moving gait command.  Continue at
+                # a bounded reduced rate instead of holding one pose forever.
+                advance = True
+                self.forced_advance_steps += 1
+            else:
+                advance = not self.frozen
         if advance:
             self._current_hold_steps = 0
         else:
@@ -92,10 +106,12 @@ class AdaptiveReferenceClock:
             "mode": "root_error_hysteresis",
             "freeze_root_error_m": self.freeze_root_error_m,
             "resume_root_error_m": self.resume_root_error_m,
+            "max_consecutive_hold_steps": self.max_consecutive_hold_steps,
             "hold_steps": self.hold_steps,
             "terminal_hold_steps": self.terminal_hold_steps,
             "freeze_events": self.freeze_events,
             "resume_events": self.resume_events,
+            "forced_advance_steps": self.forced_advance_steps,
             "longest_hold_steps": self.longest_hold_steps,
             "frozen_at_end": self.frozen,
         }
@@ -800,6 +816,7 @@ def run(args: argparse.Namespace) -> Path:
         AdaptiveReferenceClock(
             freeze_root_error_m=args.clock_freeze_root_error_m,
             resume_root_error_m=args.clock_resume_root_error_m,
+            max_consecutive_hold_steps=args.max_consecutive_clock_hold_steps,
         )
         if args.adaptive_reference_clock
         else None
@@ -1003,16 +1020,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--clock-freeze-root-error-m", type=float, default=0.20)
     parser.add_argument("--clock-resume-root-error-m", type=float, default=0.12)
+    parser.add_argument(
+        "--max-consecutive-clock-hold-steps",
+        type=int,
+        default=1,
+        help="force one reference advance after this many consecutive holds",
+    )
     parser.add_argument("--max-clock-hold-steps", type=int, default=200)
     parser.add_argument("--kit-cache", required=True)
     args = parser.parse_args(argv)
     if args.max_clock_hold_steps < 0:
         parser.error("--max-clock-hold-steps must be non-negative")
+    if args.max_consecutive_clock_hold_steps < 1:
+        parser.error("--max-consecutive-clock-hold-steps must be positive")
     if args.adaptive_reference_clock:
         try:
             AdaptiveReferenceClock(
                 freeze_root_error_m=args.clock_freeze_root_error_m,
                 resume_root_error_m=args.clock_resume_root_error_m,
+                max_consecutive_hold_steps=args.max_consecutive_clock_hold_steps,
             )
         except TrackerRecoveryError as error:
             parser.error(str(error))

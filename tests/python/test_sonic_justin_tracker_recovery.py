@@ -222,11 +222,14 @@ def test_tracker_acceptance_rejects_each_failure_gate(
 
 def test_adaptive_reference_clock_freezes_resumes_and_holds_terminal() -> None:
     clock = AdaptiveReferenceClock(
-        freeze_root_error_m=0.20, resume_root_error_m=0.12
+        freeze_root_error_m=0.20,
+        resume_root_error_m=0.12,
+        max_consecutive_hold_steps=2,
     )
     assert clock.should_advance(0.10, at_terminal=False) is True
     assert clock.should_advance(0.21, at_terminal=False) is False
     assert clock.should_advance(0.15, at_terminal=False) is False
+    assert clock.should_advance(0.14, at_terminal=False) is True
     assert clock.should_advance(0.11, at_terminal=False) is True
     assert clock.should_advance(0.05, at_terminal=True) is False
     receipt = clock.receipt()
@@ -235,6 +238,12 @@ def test_adaptive_reference_clock_freezes_resumes_and_holds_terminal() -> None:
     assert receipt["hold_steps"] == 3
     assert receipt["terminal_hold_steps"] == 1
     assert receipt["longest_hold_steps"] == 2
+    assert receipt["forced_advance_steps"] == 1
+
+
+def test_adaptive_reference_clock_rejects_unbounded_pose_holds() -> None:
+    with pytest.raises(TrackerRecoveryError, match="consecutive hold step"):
+        AdaptiveReferenceClock(max_consecutive_hold_steps=0)
 
 
 @pytest.mark.parametrize(
