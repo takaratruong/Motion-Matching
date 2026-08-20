@@ -26,6 +26,10 @@ integration = [
 torch-mm = [
   "torch>=2.13",
 ]
+corpus = [
+  "torch>=2.3",
+  "zarr>=2.16,<3",
+]
 
 [tool.setuptools]
 package-dir = {"" = "python"}

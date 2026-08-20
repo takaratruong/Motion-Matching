@@ -566,6 +566,55 @@ values are XYZW.  `offline_corpus` converts this explicitly to the canonical
 WXYZ convention at ingestion.  All output zarrs and Justin pipeline manifests
 are WXYZ.
 
+### Clean command-ball corpus reproduction (no SONIC)
+
+The clean motion-matched corpus is self-contained in this repository apart
+from two input motion assets. It does not require Justin's SONIC checkout,
+tracker checkpoint, IsaacLab simulator, or a GPU:
+
+- clean retargeted BONES G1 motion:
+  `locomotion_50hz.zarr` (39,466 clips at 50 Hz);
+- legacy TakaraWalk G1 motion: `takara_walk_50hz.npz`, SHA-256
+  `64d6e5fac6bf0b707138e044885fee8c7666fc0c0fdc3cfdf845877acb943e14`.
+
+Use Python 3.10+ with NumPy, PyTorch, and zarr 2.x. The recorded reproduction
+environment used NumPy 2.2.6, PyTorch 2.10.0, and zarr 2.18.3. Choose new
+output paths: the exporter and corpus writer intentionally refuse to
+overwrite an existing directory.
+
+```bash
+cd /path/to/Motion-Matching
+python -m pip install -e './sonic[corpus]'
+export BONES_SOURCE_ZARR=/path/to/locomotion_50hz.zarr
+export TAKARA_WALK_NPZ=/path/to/takara_walk_50hz.npz
+export MOTION_BANK_DIR=/path/to/output/takara_bones_walk_support_v2_startstop
+export CORPUS_ROOT=/path/to/output/sonic-rollouts
+export PYTHON_BIN=/path/to/python
+export CORPUS_DEVICE=cpu
+sonic/generate_flat_command_ball_corpora.sh
+```
+
+The script exports the exact 86-base/172-mirrored-BONES support selection plus
+TakaraWalk, then writes both clean zarrs:
+
+```text
+$CORPUS_ROOT/takara_bones_mm_human_full_v1_task12/
+  _source/takara_bones_mm_human_full.zarr
+    120 clips, 72,000 rows
+
+$CORPUS_ROOT/takara_bones_mm_omnidirectional_v1_task12/
+  _source/takara_bones_mm_omnidirectional.zarr
+    204 clips, 122,400 rows
+```
+
+Together these are the 324-clip, 194,400-row clean command-ball corpus. Each
+row retains raw sticks/buttons, requested and filtered command-ball state,
+matcher selection/cost diagnostics, clean G1 kinematics, Task4, and the H24
+Task12 `[local_vx, local_vy, yaw_rate]` knots. The script also writes one
+`clean_corpus_analysis.json` beside each source zarr. It deliberately stops at
+clean motion matching; it does not create the later 74,196,000 noisy SONIC
+state/action rows or their row-aligned command sidecars.
+
 Run the stages in order:
 
 ```bash
